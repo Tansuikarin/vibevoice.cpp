@@ -1,5 +1,7 @@
 build/
 build-*/
+samples/
+bench.sh
 *.o
 *.so
 *.dylib

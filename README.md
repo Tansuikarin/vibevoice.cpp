@@ -117,6 +117,31 @@ python scripts/convert_vibevoice_to_gguf.py \
 # -> [{"Start":0.0,"End":6.0,"Speaker":0,"Content":"..."}]
 ```
 
+## Benchmarks
+
+Long-form ASR on the multi-speaker
+[Microsoft VibeVoice samples](https://microsoft.github.io/VibeVoice/),
+through `vibevoice-cli asr` with the Q4_K-quantized 7B model. RTF is
+inference time / audio duration; lower is faster.
+
+| Sample        | Audio duration | Backend / hardware         | Model | Load time | Inference | RTF       |
+|---------------|---------------:|----------------------------|-------|----------:|----------:|----------:|
+| `2p_argument` | 68.5 s         | CPU - AMD Ryzen 9950X3D    | Q4_K  | 5.9 s     | 150.4 s   | **2.195** |
+| `2p_argument` | 68.5 s         | CUDA - NVIDIA GB10         | Q4_K  | 2.2 s     | 28.0 s    | **0.408** |
+
+Sample transcripts and timing are produced by `vibevoice-cli asr ... 2>&1 | grep "asr: timing"`
+(timing breakdown was added in the same release as the backend dispatch).
+Reproduce locally:
+
+```bash
+hf download mudler/vibevoice.cpp-models --local-dir models
+ffmpeg -i sample.mp3 -ac 1 -ar 24000 sample.wav
+VIBEVOICE_BACKEND=cuda ./build/bin/vibevoice-cli asr \
+    --model models/vibevoice-asr-q4_k.gguf \
+    --tokenizer models/tokenizer.gguf \
+    --audio sample.wav --max-new-tokens 8192
+```
+
 ## Tests
 
 ```bash
