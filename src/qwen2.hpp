@@ -13,9 +13,11 @@
 // what `ggml_mul_mat(W, X)` expects.
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "model_loader.hpp"
 
 #include <string>
+#include <vector>
 
 namespace vv {
 
@@ -64,6 +66,28 @@ struct Qwen2LayerOutput {
     struct ggml_tensor* v_full  = nullptr;  // same shape
 };
 
+// ResidentKV holds K/V tensors that survive across multiple per-step
+// graphs on the active backend's buffer. The classic pattern (see
+// llama.cpp's llama-kv-cache-unified.cpp): allocate once at engine
+// load, the per-step graph references the resident tensors via views
+// and writes new rows via ggml_cpy. No per-step host round-trip, no
+// per-step backend allocation for the K/V data.
+//
+// Lifetime is tied to the ggml_context that owns the tensor metadata;
+// the backend buffer owns the data. Both are freed in `free()`.
+struct ResidentKV {
+    struct ggml_context*    ctx     = nullptr;
+    ggml_backend_buffer_t   buffer  = nullptr;
+    std::vector<struct ggml_tensor*> k;   // [hd, n_kv, max_seq, 1] per layer
+    std::vector<struct ggml_tensor*> v;   // same
+    int                     max_seq  = 0;
+    int                     past_len = 0;
+
+    bool init(int n_layers, int hd, int n_kv, int max_seq);
+    void free();
+    ~ResidentKV();
+};
+
 // Build a single Qwen2 layer's compute graph. `x` is [hidden, n_tokens, B];
 // `pos` is an int32 vector of length n_tokens with ABSOLUTE positions; `mask`
 // is the additive attention mask of shape [past+n_tokens, n_tokens, 1, 1].
@@ -83,6 +107,34 @@ Qwen2LayerOutput qwen2_layer_forward(struct ggml_context*     ctx,
                                      struct ggml_tensor*      v_past,
                                      const Qwen2LayerWeights& w,
                                      const Qwen2Hparams&      hp);
+
+// Persistent-KV variant. Instead of taking k_past/v_past as graph inputs
+// the caller has to upload, this references the resident `kv` tensors
+// directly via views and uses ggml_cpy to write the new K/V rows into
+// `kv.k[layer_idx]` / `kv.v[layer_idx]` at offset `kv.past_len`.
+//
+// The caller is responsible for:
+//   1. Building forward expand on the returned `k_write` / `v_write` cpy
+//      tensors so the writes actually land in the resident buffer.
+//   2. Updating `kv.past_len` after the graph has executed.
+//
+// Mask shape is [kv.past_len + n_tokens, n_tokens, 1, B] - it covers the
+// full prefix the resident tensor will hold *after* this step's writes.
+struct Qwen2LayerOutputResident {
+    struct ggml_tensor* y       = nullptr;
+    struct ggml_tensor* k_write = nullptr;  // ggml_cpy result; expand-on-graph
+    struct ggml_tensor* v_write = nullptr;
+};
+
+Qwen2LayerOutputResident qwen2_layer_forward_resident(
+    struct ggml_context*     ctx,
+    struct ggml_tensor*      x,
+    struct ggml_tensor*      pos,
+    struct ggml_tensor*      mask,
+    ResidentKV&              kv,
+    int                      layer_idx,
+    const Qwen2LayerWeights& w,
+    const Qwen2Hparams&      hp);
 
 }  // namespace vv
 

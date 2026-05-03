@@ -1,4 +1,5 @@
 #include "qwen2.hpp"
+#include "backend.hpp"
 #include "common.hpp"
 #include "rms_norm.hpp"
 #include "rope.hpp"
@@ -198,6 +199,162 @@ Qwen2LayerOutput qwen2_layer_forward(struct ggml_context*     ctx,
     out.y      = ggml_add(ctx, h, f);
     out.k_full = k_full;
     out.v_full = v_full;
+    return out;
+}
+
+// ResidentKV ----------------------------------------------------------------
+
+bool ResidentKV::init(int n_layers, int hd, int n_kv, int max_seq_in) {
+    free();
+
+    struct ggml_init_params p {};
+    p.mem_size = ggml_tensor_overhead() * (2 * n_layers + 16);
+    p.no_alloc = true;
+    ctx = ggml_init(p);
+    if (!ctx) return false;
+
+    k.assign(n_layers, nullptr);
+    v.assign(n_layers, nullptr);
+    for (int i = 0; i < n_layers; ++i) {
+        k[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, n_kv, max_seq_in, 1);
+        v[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, n_kv, max_seq_in, 1);
+        if (!k[i] || !v[i]) { free(); return false; }
+    }
+    buffer = vv::allocate_ctx_tensors(ctx);
+    if (!buffer) { free(); return false; }
+
+    max_seq  = max_seq_in;
+    past_len = 0;
+    return true;
+}
+
+void ResidentKV::free() {
+    if (buffer) {
+        ggml_backend_buffer_free(buffer);
+        buffer = nullptr;
+    }
+    if (ctx) {
+        ggml_free(ctx);
+        ctx = nullptr;
+    }
+    k.clear();
+    v.clear();
+    max_seq  = 0;
+    past_len = 0;
+}
+
+ResidentKV::~ResidentKV() { free(); }
+
+// qwen2_layer_forward_resident ---------------------------------------------
+
+Qwen2LayerOutputResident qwen2_layer_forward_resident(
+    struct ggml_context*     ctx,
+    struct ggml_tensor*      x,
+    struct ggml_tensor*      pos,
+    struct ggml_tensor*      mask,
+    ResidentKV&              kvs,
+    int                      layer_idx,
+    const Qwen2LayerWeights& w,
+    const Qwen2Hparams&      hp) {
+
+    const int hd     = hp.head_dim;
+    const int n_h    = hp.n_heads;
+    const int n_kv_h = hp.n_kv_heads;
+
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_batch  = x->ne[2] > 0 ? x->ne[2] : 1;
+    const int     past_len = kvs.past_len;
+    const int     full_len = past_len + static_cast<int>(n_tokens);
+
+    GGML_ASSERT(full_len <= kvs.max_seq);
+    GGML_ASSERT(layer_idx >= 0 && layer_idx < static_cast<int>(kvs.k.size()));
+
+    // ---- attention pre-norm + Q/K/V + RoPE on the new tokens only ----
+    struct ggml_tensor* xn = rms_norm(ctx, x, w.attn_norm, hp.rms_norm_eps);
+    struct ggml_tensor* q  = linear(ctx, w.attn_q, xn, w.attn_q_bias);
+    struct ggml_tensor* k  = linear(ctx, w.attn_k, xn, w.attn_k_bias);
+    struct ggml_tensor* v  = linear(ctx, w.attn_v, xn, w.attn_v_bias);
+
+    q = ggml_reshape_4d(ctx, q, hd, n_h,    n_tokens, n_batch);
+    k = ggml_reshape_4d(ctx, k, hd, n_kv_h, n_tokens, n_batch);
+    v = ggml_reshape_4d(ctx, v, hd, n_kv_h, n_tokens, n_batch);
+
+    q = ggml_rope_ext(ctx, q, pos, /*freq_factors=*/nullptr,
+                      hd, kRopeMode, /*n_ctx_orig=*/0,
+                      hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    k = ggml_rope_ext(ctx, k, pos, /*freq_factors=*/nullptr,
+                      hd, kRopeMode, 0,
+                      hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+    // ---- write new K/V into the resident buffer at offset past_len ----
+    // Resident shape per layer: [hd, n_kv, max_seq, 1].
+    // The destination view covers slots [past_len, past_len+n_tokens) on
+    // the seq axis (axis 2).
+    struct ggml_tensor* k_resident = kvs.k[layer_idx];
+    struct ggml_tensor* v_resident = kvs.v[layer_idx];
+    const size_t k_offset = static_cast<size_t>(past_len) * k_resident->nb[2];
+    const size_t v_offset = static_cast<size_t>(past_len) * v_resident->nb[2];
+
+    struct ggml_tensor* k_dst = ggml_view_4d(ctx, k_resident,
+        hd, n_kv_h, n_tokens, n_batch,
+        k_resident->nb[1], k_resident->nb[2], k_resident->nb[3], k_offset);
+    struct ggml_tensor* v_dst = ggml_view_4d(ctx, v_resident,
+        hd, n_kv_h, n_tokens, n_batch,
+        v_resident->nb[1], v_resident->nb[2], v_resident->nb[3], v_offset);
+
+    struct ggml_tensor* k_write = ggml_cpy(ctx, k, k_dst);
+    struct ggml_tensor* v_write = ggml_cpy(ctx, v, v_dst);
+
+    // ---- read full K/V (past + new) as a view of the resident tensor ----
+    // The graph builder must add k_write/v_write to the forward expand
+    // BEFORE these reads so the writes complete first; that's the caller's
+    // job (we return the writes alongside `y`).
+    struct ggml_tensor* k_full = ggml_view_4d(ctx, k_resident,
+        hd, n_kv_h, full_len, n_batch,
+        k_resident->nb[1], k_resident->nb[2], k_resident->nb[3], 0);
+    struct ggml_tensor* v_full = ggml_view_4d(ctx, v_resident,
+        hd, n_kv_h, full_len, n_batch,
+        v_resident->nb[1], v_resident->nb[2], v_resident->nb[3], 0);
+
+    // ---- attention (FA when supported, eager otherwise) ----
+    struct ggml_tensor* q_p = ggml_permute(ctx, q,      0, 2, 1, 3);
+    struct ggml_tensor* k_p = ggml_permute(ctx, k_full, 0, 2, 1, 3);
+    struct ggml_tensor* v_p = ggml_permute(ctx, v_full, 0, 2, 1, 3);
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    struct ggml_tensor* o = nullptr;
+
+    if (hp.use_flash_attn) {
+        struct ggml_tensor* k_fa = (k_p->type == GGML_TYPE_F32)
+                                   ? ggml_cast(ctx, k_p, GGML_TYPE_F16) : k_p;
+        struct ggml_tensor* v_fa = (v_p->type == GGML_TYPE_F32)
+                                   ? ggml_cast(ctx, v_p, GGML_TYPE_F16) : v_p;
+        o = ggml_flash_attn_ext(ctx, q_p, k_fa, v_fa, mask,
+                                scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+        o = ggml_cont_2d(ctx, o, n_h * hd, n_tokens * n_batch);
+    } else {
+        struct ggml_tensor* scores = ggml_mul_mat(ctx, k_p, q_p);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        struct ggml_tensor* attn = ggml_soft_max_ext(ctx, scores, mask, scale, /*max_bias=*/0.0f);
+        struct ggml_tensor* v_t  = maybe_cont(ctx, ggml_transpose(ctx, v_p));
+        o = ggml_mul_mat(ctx, v_t, attn);
+        o = ggml_permute(ctx, o, 0, 2, 1, 3);
+        o = ggml_cont_2d(ctx, o, n_h * hd, n_tokens * n_batch);
+    }
+    if (n_batch > 1) {
+        o = ggml_reshape_3d(ctx, o, n_h * hd, n_tokens, n_batch);
+    }
+
+    o = ggml_mul_mat(ctx, w.attn_o, o);
+    struct ggml_tensor* h  = ggml_add(ctx, x, o);
+    struct ggml_tensor* hn = rms_norm(ctx, h, w.ffn_norm, hp.rms_norm_eps);
+    struct ggml_tensor* f  = swiglu_ffn(ctx, hn, w);
+
+    Qwen2LayerOutputResident out;
+    out.y       = ggml_add(ctx, h, f);
+    out.k_write = k_write;
+    out.v_write = v_write;
     return out;
 }
 
