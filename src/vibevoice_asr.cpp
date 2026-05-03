@@ -493,21 +493,17 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
         hp.rms_norm_eps   = cfg.rms_norm_eps;
         hp.use_flash_attn = vv::backend_supports_flash_attn();
 
-        // Default chunk size depends on whether FA is available:
-        //   * With FA: single-shot is fine - no [N,N,n_h] materialization,
-        //     activation pool stays at O(N*hidden). Chunking on GPU would
-        //     just add per-chunk K/V DtoH+HtoD PCIe round trips.
-        //   * Without FA: bound the per-chunk peak so the eager [seq_kv,
-        //     seq_q, n_h] scores tensor stays small. 512 keeps it under
-        //     ~430 MB FP32 even at N=7500.
-        // VIBEVOICE_PREFILL_BATCH overrides either default.
+        // Default chunk size = 512 unconditionally. Even with FA, an
+        // N=7500 single-shot prefill blew up ggml's activation pool
+        // (~101 GB intermediate observed empirically), so chunking is
+        // not optional for long audios. 512 keeps the eager
+        // [seq_kv, seq_q, n_h] scores tensor under ~430 MB F32 in the
+        // no-FA fallback, and on the FA path makes the per-chunk
+        // gallocr peak roughly proportional to chunk_K * past * hd.
+        // VIBEVOICE_PREFILL_BATCH overrides if you want to A/B.
         const char* env_batch = std::getenv("VIBEVOICE_PREFILL_BATCH");
-        int kPrefillBatch;
-        if (env_batch && std::atoi(env_batch) > 0) {
-            kPrefillBatch = std::atoi(env_batch);
-        } else {
-            kPrefillBatch = hp.use_flash_attn ? N : 512;
-        }
+        int kPrefillBatch = (env_batch && std::atoi(env_batch) > 0)
+                            ? std::atoi(env_batch) : 512;
         if (kPrefillBatch > N) kPrefillBatch = N;
 
         const int hd = cfg.head_dim, n_kv = cfg.n_kv_heads;
