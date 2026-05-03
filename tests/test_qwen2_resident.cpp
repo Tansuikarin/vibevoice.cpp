@@ -1,17 +1,26 @@
 // Parity test for qwen2_layer_forward_resident.
 //
-// Same single-layer fixture as test_qwen2_block, but runs the input through
-// THREE paths and asserts they all produce the same hidden state:
+// Same single-layer fixture as test_qwen2_block. Runs the input through
+// FIVE paths and asserts they all produce the same hidden state:
 //
-//   A) qwen2_layer_forward (host-resident k_past=null)  - the reference
-//   B) qwen2_layer_forward_resident with kv.past_len=0  - single-shot
-//   C) qwen2_layer_forward_resident, prefix in 2 chunks - chunked-prefill
-//      (proves the cpy / view ordering inside qwen2_layer_forward_resident
-//      actually makes the second chunk's attention see chunk 1's K/V)
+//   A) qwen2_layer_forward (host-resident k_past=null)         - the reference
+//   B) qwen2_layer_forward_resident with kv.past_len=0         - single-shot
+//   C) qwen2_layer_forward_resident, prefix in 2 chunks        - chunked
+//   D) qwen2_layer_forward_resident, prefix in 4 chunks        - more chunks
+//   E) DEPTH-stacked classic vs resident chunks                - compounding
+//
+// Path C/D prove the cpy / view ordering inside qwen2_layer_forward_resident
+// actually makes the second chunk's attention see earlier chunks' K/V.
+// Path E chains DEPTH copies of the same fixture layer (passing each
+// layer's hidden output as the next layer's input) to flush out errors
+// that compound across layers - the failure mode of the earlier ASR
+// migration produced garbled (not slightly wrong) text, so per-layer
+// noise compounding is the prime suspect.
 //
 // Tolerance: max-abs < 1e-5 fp32 between paths (tighter than the HF parity
 // because we're comparing the same kernel against itself, only the K/V
-// access pattern differs).
+// access pattern differs). FA path is loosened to 1e-3 / 1e-2 since
+// fp16 K-storage in flash-attn introduces small precision drift.
 //
 // Skips with rc=77 if the fixture is missing.
 
@@ -267,6 +276,98 @@ int main() {
                     y_chunk2.data(), sizeof(float) * y_chunk2.size());
     }
 
+    // ---- D) resident chunked, prefix in 4 chunks ----
+    std::vector<float> y_resident_four;
+    y_resident_four.assign(static_cast<size_t>(hp.hidden_size) * seq * batch, 0.0f);
+    {
+        vv::ResidentKV kv;
+        if (!kv.init(1, hp.head_dim, hp.n_kv_heads, seq + 16)) {
+            std::fprintf(stderr, "FAIL: ResidentKV.init (4 chunks)\n"); return 13;
+        }
+        // Split into 4 ~equal chunks; tail picks up the remainder so we
+        // also cover non-uniform last chunk.
+        const int q1 = seq / 4;
+        const int q2 = seq / 2;
+        const int q3 = (3 * seq) / 4;
+        const int boundaries[5] = { 0, q1, q2, q3, seq };
+        for (int c = 0; c < 4; ++c) {
+            const int start  = boundaries[c];
+            const int chunk_K = boundaries[c + 1] - start;
+            std::vector<float> in_c(
+                input + static_cast<size_t>(hp.hidden_size) * start * batch,
+                input + static_cast<size_t>(hp.hidden_size) * (start + chunk_K) * batch);
+            std::vector<int32_t> pos_c(pos_ids + start, pos_ids + start + chunk_K);
+            std::vector<float> y_c;
+            if (!run_resident_chunk(kv, 0, hp, w, in_c.data(), pos_c.data(),
+                                    chunk_K, batch, &y_c)) {
+                std::fprintf(stderr, "FAIL: resident chunk %d/4\n", c + 1); return 14;
+            }
+            std::memcpy(y_resident_four.data() + static_cast<size_t>(hp.hidden_size) * start * batch,
+                        y_c.data(), sizeof(float) * y_c.size());
+        }
+    }
+
+    // ---- E) DEPTH-stacked classic vs resident chunks ----
+    // Chains the same fixture layer DEPTH times, threading hidden through.
+    // Both paths use exactly the same kernel for each layer; the resident
+    // path additionally maintains per-layer K/V across two chunks. This
+    // mirrors the multi-layer integration the ASR migration does.
+    constexpr int DEPTH = 28;  // matches Qwen2.5-7B's lm layer count
+    std::vector<float> y_chain_classic(static_cast<size_t>(hp.hidden_size) * seq * batch);
+    {
+        std::vector<float> h(input, input + y_chain_classic.size());
+        for (int d = 0; d < DEPTH; ++d) {
+            std::vector<float> out;
+            if (!run_classic(hp, w, h.data(), pos_ids, seq, batch, &out)) {
+                std::fprintf(stderr, "FAIL: classic chain layer %d\n", d); return 15;
+            }
+            h.swap(out);
+        }
+        y_chain_classic.swap(h);
+    }
+    std::vector<float> y_chain_resident(static_cast<size_t>(hp.hidden_size) * seq * batch);
+    {
+        // One ResidentKV with DEPTH slots; two chunks per layer.
+        vv::ResidentKV kv;
+        if (!kv.init(DEPTH, hp.head_dim, hp.n_kv_heads, seq + 16)) {
+            std::fprintf(stderr, "FAIL: ResidentKV.init (chain)\n"); return 16;
+        }
+        const int split = seq / 2;
+        std::vector<float> h(input, input + y_chain_resident.size());
+
+        for (int d = 0; d < DEPTH; ++d) {
+            // Reset past_len per layer-pass: each layer's K/V gets refilled
+            // from chunk 1 (offset 0) and chunk 2 (offset split).
+            kv.past_len = 0;
+
+            // chunk 1
+            std::vector<float> in1(h.data(), h.data() + static_cast<size_t>(hp.hidden_size) * split * batch);
+            std::vector<int32_t> pos1(pos_ids, pos_ids + split);
+            std::vector<float> y1;
+            if (!run_resident_chunk(kv, d, hp, w, in1.data(), pos1.data(),
+                                    split, batch, &y1)) {
+                std::fprintf(stderr, "FAIL: resident chain layer %d chunk 1\n", d);
+                return 17;
+            }
+            // chunk 2
+            const int rest = seq - split;
+            std::vector<float> in2(h.data() + static_cast<size_t>(hp.hidden_size) * split * batch,
+                                   h.data() + static_cast<size_t>(hp.hidden_size) * seq * batch);
+            std::vector<int32_t> pos2(pos_ids + split, pos_ids + seq);
+            std::vector<float> y2;
+            if (!run_resident_chunk(kv, d, hp, w, in2.data(), pos2.data(),
+                                    rest, batch, &y2)) {
+                std::fprintf(stderr, "FAIL: resident chain layer %d chunk 2\n", d);
+                return 18;
+            }
+            // splice
+            std::memcpy(h.data(), y1.data(), sizeof(float) * y1.size());
+            std::memcpy(h.data() + static_cast<size_t>(hp.hidden_size) * split * batch,
+                        y2.data(), sizeof(float) * y2.size());
+        }
+        y_chain_resident.swap(h);
+    }
+
     // Tolerances differ by attention path. Eager (mul_mat -> soft_max ->
     // mul_mat) is bit-exact between classic and resident because the K/V
     // values written to the resident buffer in chunk 1 are read back by
@@ -274,25 +375,33 @@ int main() {
     // internally; reading K via a strided view of the resident tensor
     // (max_seq != ne[2] of the live K-window) introduces a small fp16
     // noise relative to the all-in-one classic graph.
-    const double tol_one = 1e-5;
-    const double tol_two = hp.use_flash_attn ? 1e-3 : 1e-5;
-    const double d_one   = max_abs_diff(y_classic, y_resident_one);
-    const double d_two   = max_abs_diff(y_classic, y_resident_two);
-    std::printf("  classic vs resident-1chunk:  max_abs=%.3e (tol=%.0e)\n", d_one, tol_one);
-    std::printf("  classic vs resident-2chunks: max_abs=%.3e (tol=%.0e)\n", d_two, tol_two);
+    const double tol_one   = 1e-5;
+    const double tol_two   = hp.use_flash_attn ? 1e-3  : 1e-5;
+    const double tol_four  = hp.use_flash_attn ? 1e-3  : 1e-5;
+    // Compounding bound: per-layer error up to ~tol_two grows with depth.
+    // 1e-3 * sqrt(28) ~ 5e-3, allow generous headroom for FA. Eager stays
+    // tight - if compounding ever pushes it past 1e-4 we want to know.
+    const double tol_chain = hp.use_flash_attn ? 1e-1  : 1e-4;
+    const double d_one    = max_abs_diff(y_classic,         y_resident_one);
+    const double d_two    = max_abs_diff(y_classic,         y_resident_two);
+    const double d_four   = max_abs_diff(y_classic,         y_resident_four);
+    const double d_chain  = max_abs_diff(y_chain_classic,   y_chain_resident);
+    std::printf("  classic vs resident-1chunk:    max_abs=%.3e (tol=%.0e)\n", d_one,   tol_one);
+    std::printf("  classic vs resident-2chunks:   max_abs=%.3e (tol=%.0e)\n", d_two,   tol_two);
+    std::printf("  classic vs resident-4chunks:   max_abs=%.3e (tol=%.0e)\n", d_four,  tol_four);
+    std::printf("  chain%d  classic vs resident:  max_abs=%.3e (tol=%.0e)\n",
+                DEPTH, d_chain, tol_chain);
 
-    if (d_one > tol_one) {
-        std::fprintf(stderr,
-            "FAIL: resident single-shot diverges from classic (%.3e > %.0e)\n",
-            d_one, tol_one);
-        return 11;
+    int rc = 0;
+    if (d_one   > tol_one)   { std::fprintf(stderr, "FAIL: resident single-shot\n"); rc = 11; }
+    if (d_two   > tol_two)   { std::fprintf(stderr, "FAIL: resident 2-chunks\n");   rc = 12; }
+    if (d_four  > tol_four)  { std::fprintf(stderr, "FAIL: resident 4-chunks\n");   rc = 19; }
+    if (d_chain > tol_chain) {
+        std::fprintf(stderr, "FAIL: depth-%d chain (%.3e > %.0e)\n",
+                     DEPTH, d_chain, tol_chain);
+        rc = 20;
     }
-    if (d_two > tol_two) {
-        std::fprintf(stderr,
-            "FAIL: resident chunked diverges from classic (%.3e > %.0e)\n",
-            d_two, tol_two);
-        return 12;
-    }
+    if (rc) return rc;
     std::printf("test_qwen2_resident: OK\n");
     return 0;
 }
