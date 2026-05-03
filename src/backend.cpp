@@ -154,4 +154,45 @@ ggml_backend_buffer_t allocate_ctx_tensors(ggml_context* ctx) {
     return ggml_backend_alloc_ctx_tensors(ctx, b);
 }
 
+bool backend_supports_flash_attn() {
+    static std::once_flag detect_once;
+    static bool supported = false;
+    std::call_once(detect_once, [] {
+        const char* env = std::getenv("VIBEVOICE_FLASH_ATTN");
+        if (env && (std::string(env) == "0" || lower(env) == "false" || lower(env) == "off")) {
+            VV_LOG_INFO("backend: flash-attn disabled via VIBEVOICE_FLASH_ATTN=%s", env);
+            supported = false;
+            return;
+        }
+
+        ggml_backend_t b = backend();
+        if (!b) {
+            supported = false;
+            return;
+        }
+
+        // Build a tiny dummy FA op (no allocation) and ask the backend
+        // whether it can run it. Shapes are arbitrary - we only need
+        // the op kind + dtypes to match what we'd build for real.
+        struct ggml_init_params ip {};
+        ip.mem_size  = ggml_tensor_overhead() * 16;
+        ip.no_alloc  = true;
+        ggml_context* ctx = ggml_init(ip);
+        const int hd = 128, n_h = 8, n_kv = 2, seq = 16;
+        ggml_tensor* q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, seq, n_h,  1);
+        ggml_tensor* k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, seq, n_kv, 1);
+        ggml_tensor* v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, seq, n_kv, 1);
+        ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, seq, seq);
+        ggml_tensor* op   = ggml_flash_attn_ext(ctx, q, k, v, mask,
+                                                1.0f / 11.31f, 0.0f, 0.0f);
+        supported = op && ggml_backend_supports_op(b, op);
+        ggml_free(ctx);
+
+        VV_LOG_INFO("backend: flash-attn %s on %s",
+                    supported ? "available" : "unavailable",
+                    g_name.c_str());
+    });
+    return supported;
+}
+
 }  // namespace vv

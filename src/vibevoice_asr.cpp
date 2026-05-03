@@ -466,102 +466,204 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
                     sizeof(float) * hidden);
     }
 
-    // ---- 7. LM prefill (single 28-layer stack with final norm) ----
-    extern bool run_qwen2_stack(struct ggml_context*, const VibeVoiceConfig&,
-                                const std::vector<Qwen2LayerWeights>&,
-                                struct ggml_tensor*, int, int,
-                                const float*, std::vector<LayerKV>*,
-                                std::vector<float>*, std::vector<float>*);
-    // We rely on the same run_qwen2_stack impl as TTS — it lives in the
-    // anonymous namespace of vibevoice_tts.cpp. Move/dup or expose it via
-    // a header to share. For v1 we re-implement the prefill inline:
+    // ---- 7. LM prefill ----
+    // Two memory optimizations layered together (see docs/long-form-asr.md):
+    //   * Flash-attention path in qwen2_layer_forward (when the active
+    //     backend supports it). FA never materializes the [seq_kv, seq_q,
+    //     n_h] scores tensor, so peak activation memory becomes O(seq*hd)
+    //     per layer instead of O(seq^2 * n_h) - 6 GB FP32 per layer at
+    //     N=7500 in eager mode.
+    //   * Chunked prefill: process the prompt+audio prefix in batches of
+    //     kPrefillBatch tokens, accumulating each layer's K/V cache as we
+    //     go. This bounds the K/V tensor staging memory to O(K * past)
+    //     and keeps the activation pool size constant across chunks.
+    // Both fall back gracefully: FA -> eager (set VIBEVOICE_FLASH_ATTN=0
+    // or just run on a backend that doesn't advertise the op), chunked ->
+    // single-shot (set VIBEVOICE_PREFILL_BATCH >= N).
     std::vector<LayerKV> kv_lm(cfg.n_layers_lm);
-    std::vector<float>   hidden_states_full;
+    std::vector<float>   hidden_last(hidden);
 
     {
         Qwen2Hparams hp;
-        hp.hidden_size  = hidden;
-        hp.n_heads      = cfg.n_heads;
-        hp.n_kv_heads   = cfg.n_kv_heads;
-        hp.head_dim     = cfg.head_dim;
-        hp.rope_theta   = cfg.rope_theta;
-        hp.rms_norm_eps = cfg.rms_norm_eps;
+        hp.hidden_size    = hidden;
+        hp.n_heads        = cfg.n_heads;
+        hp.n_kv_heads     = cfg.n_kv_heads;
+        hp.head_dim       = cfg.head_dim;
+        hp.rope_theta     = cfg.rope_theta;
+        hp.rms_norm_eps   = cfg.rms_norm_eps;
+        hp.use_flash_attn = vv::backend_supports_flash_attn();
 
-        // Prefill via backend dispatch. Graph metadata only in the ctx;
-        // actual activation memory is allocated by gallocr inside
-        // vv::compute_graph.
-        struct ggml_init_params ip {};
-        ip.mem_size = ggml_tensor_overhead() * 32768
-                    + ggml_graph_overhead_custom(32768, false);
-        ip.no_alloc = true;
-        struct ggml_context* ctx = ggml_init(ip);
-
-        struct ggml_tensor* x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, N, 1);
-        ggml_set_name(x, "prefill_x");
-        struct ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
-        ggml_set_name(pos, "prefill_pos");
-        struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, N);
-        ggml_set_name(mask, "prefill_mask");
-
-        struct ggml_tensor* h = x;
-        std::vector<struct ggml_tensor*> k_news(w.lm_layers.size()),
-                                         v_news(w.lm_layers.size());
-        for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-            auto out = qwen2_layer_forward(ctx, h, pos, mask, nullptr, nullptr,
-                                           w.lm_layers[li], hp);
-            h = out.y;
-            k_news[li] = out.k_full;
-            v_news[li] = out.v_full;
+        // Default chunk size depends on whether FA is available:
+        //   * With FA: single-shot is fine - no [N,N,n_h] materialization,
+        //     activation pool stays at O(N*hidden). Chunking on GPU would
+        //     just add per-chunk K/V DtoH+HtoD PCIe round trips.
+        //   * Without FA: bound the per-chunk peak so the eager [seq_kv,
+        //     seq_q, n_h] scores tensor stays small. 512 keeps it under
+        //     ~430 MB FP32 even at N=7500.
+        // VIBEVOICE_PREFILL_BATCH overrides either default.
+        const char* env_batch = std::getenv("VIBEVOICE_PREFILL_BATCH");
+        int kPrefillBatch;
+        if (env_batch && std::atoi(env_batch) > 0) {
+            kPrefillBatch = std::atoi(env_batch);
+        } else {
+            kPrefillBatch = hp.use_flash_attn ? N : 512;
         }
-        if (w.tlm_output_norm) {
-            h = rms_norm(ctx, h, w.tlm_output_norm, cfg.rms_norm_eps);
-        }
-        struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
-        ggml_build_forward_expand(gf, h);
-        for (auto* t : k_news) ggml_build_forward_expand(gf, t);
-        for (auto* t : v_news) ggml_build_forward_expand(gf, t);
-
-        ggml_backend_buffer_t in_buf = vv::allocate_ctx_tensors(ctx);
-        if (!in_buf) { ggml_free(ctx); return -10; }
-        ggml_backend_tensor_set(x, text_embeds.data(), 0, sizeof(float) * hidden * N);
-        std::vector<int32_t> pos_v(N);
-        for (int i = 0; i < N; ++i) pos_v[i] = i;
-        ggml_backend_tensor_set(pos, pos_v.data(), 0, sizeof(int32_t) * N);
-        std::vector<float> mask_v(static_cast<size_t>(N) * N);
-        for (int i = 0; i < N; ++i)
-            for (int j = 0; j < N; ++j)
-                mask_v[i * N + j] = (j > i) ? -INFINITY : 0.0f;
-        ggml_backend_tensor_set(mask, mask_v.data(), 0, sizeof(float) * mask_v.size());
-
-        if (!vv::compute_graph(gf)) {
-            ggml_backend_buffer_free(in_buf);
-            ggml_free(ctx);
-            return -10;
-        }
-
-        hidden_states_full.assign(static_cast<size_t>(hidden) * N, 0.0f);
-        ggml_backend_tensor_get(h, hidden_states_full.data(), 0, sizeof(float) * hidden * N);
+        if (kPrefillBatch > N) kPrefillBatch = N;
 
         const int hd = cfg.head_dim, n_kv = cfg.n_kv_heads;
+
+        if (p.verbose) {
+            std::fprintf(stderr,
+                         "[asr] prefill: N=%d batch=%d flash_attn=%s\n",
+                         N, kPrefillBatch, hp.use_flash_attn ? "yes" : "no");
+        }
+
+        // Pre-size each layer's K/V buffer so we can write directly at
+        // the right offsets without per-chunk vector resizing.
         for (size_t li = 0; li < w.lm_layers.size(); ++li) {
             const size_t per = static_cast<size_t>(hd) * n_kv * N;
             kv_lm[li].k.assign(per, 0.0f);
             kv_lm[li].v.assign(per, 0.0f);
-            ggml_backend_tensor_get(k_news[li], kv_lm[li].k.data(), 0, sizeof(float) * per);
-            ggml_backend_tensor_get(v_news[li], kv_lm[li].v.data(), 0, sizeof(float) * per);
-            kv_lm[li].past_len = N;
+            kv_lm[li].past_len = 0;
         }
-        ggml_backend_buffer_free(in_buf);
-        ggml_free(ctx);
+
+        for (int chunk_start = 0; chunk_start < N; chunk_start += kPrefillBatch) {
+            const int chunk_K = std::min(kPrefillBatch, N - chunk_start);
+            const int kv_old  = chunk_start;          // length of past K/V
+            const int kv_new  = chunk_start + chunk_K;
+
+            struct ggml_init_params ip {};
+            ip.mem_size = ggml_tensor_overhead() * 32768
+                        + ggml_graph_overhead_custom(32768, false);
+            ip.no_alloc = true;
+            struct ggml_context* ctx = ggml_init(ip);
+
+            struct ggml_tensor* x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                                                       hidden, chunk_K, 1);
+            ggml_set_name(x, "prefill_x");
+            struct ggml_tensor* posv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, chunk_K);
+            ggml_set_name(posv, "prefill_pos");
+
+            // FA contract requires F16; the eager path accepts F16 too, so
+            // we always use F16 to keep one mask format across both paths.
+            struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
+                                                          kv_new, chunk_K);
+            ggml_set_name(mask, "prefill_mask");
+
+            // Per-layer past K/V tensors (null on the first chunk).
+            std::vector<struct ggml_tensor*> k_pasts(w.lm_layers.size(), nullptr),
+                                             v_pasts(w.lm_layers.size(), nullptr);
+            if (kv_old > 0) {
+                for (size_t li = 0; li < w.lm_layers.size(); ++li) {
+                    k_pasts[li] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                                                     hd, n_kv, kv_old, 1);
+                    v_pasts[li] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                                                     hd, n_kv, kv_old, 1);
+                }
+            }
+
+            struct ggml_tensor* h = x;
+            std::vector<struct ggml_tensor*> k_news(w.lm_layers.size()),
+                                             v_news(w.lm_layers.size());
+            for (size_t li = 0; li < w.lm_layers.size(); ++li) {
+                auto out = qwen2_layer_forward(ctx, h, posv, mask,
+                                               k_pasts[li], v_pasts[li],
+                                               w.lm_layers[li], hp);
+                h = out.y;
+                k_news[li] = out.k_full;
+                v_news[li] = out.v_full;
+            }
+            // Final RMSNorm only matters for the last chunk - cheap, leave
+            // it on every chunk so the graph shape stays stable across
+            // gallocr's reuse pool.
+            if (w.tlm_output_norm) {
+                h = rms_norm(ctx, h, w.tlm_output_norm, cfg.rms_norm_eps);
+            }
+            struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
+            ggml_build_forward_expand(gf, h);
+            for (auto* t : k_news) ggml_build_forward_expand(gf, t);
+            for (auto* t : v_news) ggml_build_forward_expand(gf, t);
+
+            ggml_backend_buffer_t in_buf = vv::allocate_ctx_tensors(ctx);
+            if (!in_buf) { ggml_free(ctx); return -10; }
+
+            ggml_backend_tensor_set(x,
+                text_embeds.data() + static_cast<size_t>(hidden) * chunk_start,
+                0, sizeof(float) * hidden * chunk_K);
+
+            std::vector<int32_t> pos_v(chunk_K);
+            for (int i = 0; i < chunk_K; ++i) pos_v[i] = chunk_start + i;
+            ggml_backend_tensor_set(posv, pos_v.data(), 0,
+                                    sizeof(int32_t) * chunk_K);
+
+            // Causal mask: query at chunk_start+q can attend to keys at
+            // [0, chunk_start+q]. Mask is F16 row-major [kv_new, chunk_K].
+            std::vector<ggml_fp16_t> mask_v(static_cast<size_t>(kv_new) * chunk_K);
+            const ggml_fp16_t f16_zero = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
+            for (int q = 0; q < chunk_K; ++q) {
+                const int q_abs = chunk_start + q;
+                for (int k = 0; k < kv_new; ++k) {
+                    mask_v[static_cast<size_t>(q) * kv_new + k] =
+                        (k > q_abs) ? f16_ninf : f16_zero;
+                }
+            }
+            ggml_backend_tensor_set(mask, mask_v.data(), 0,
+                                    sizeof(ggml_fp16_t) * mask_v.size());
+
+            if (kv_old > 0) {
+                for (size_t li = 0; li < w.lm_layers.size(); ++li) {
+                    const size_t per = static_cast<size_t>(hd) * n_kv * kv_old;
+                    ggml_backend_tensor_set(k_pasts[li], kv_lm[li].k.data(),
+                                            0, sizeof(float) * per);
+                    ggml_backend_tensor_set(v_pasts[li], kv_lm[li].v.data(),
+                                            0, sizeof(float) * per);
+                }
+            }
+
+            if (!vv::compute_graph(gf)) {
+                ggml_backend_buffer_free(in_buf);
+                ggml_free(ctx);
+                return -10;
+            }
+
+            // Capture the last chunk's last hidden state - that's what
+            // greedy decode bootstraps from.
+            if (chunk_start + chunk_K == N) {
+                ggml_backend_tensor_get(h, hidden_last.data(),
+                    sizeof(float) * hidden * (chunk_K - 1),
+                    sizeof(float) * hidden);
+            }
+
+            // Pull only the new K/V rows (offset past kv_old) and stash
+            // them at [kv_old, kv_new) inside the per-layer cache.
+            const size_t per_old = static_cast<size_t>(hd) * n_kv * kv_old;
+            const size_t per_new = static_cast<size_t>(hd) * n_kv * chunk_K;
+            for (size_t li = 0; li < w.lm_layers.size(); ++li) {
+                ggml_backend_tensor_get(k_news[li],
+                    kv_lm[li].k.data() + per_old,
+                    sizeof(float) * per_old, sizeof(float) * per_new);
+                ggml_backend_tensor_get(v_news[li],
+                    kv_lm[li].v.data() + per_old,
+                    sizeof(float) * per_old, sizeof(float) * per_new);
+                kv_lm[li].past_len = kv_new;
+            }
+
+            ggml_backend_buffer_free(in_buf);
+            ggml_free(ctx);
+
+            if (p.verbose) {
+                std::fprintf(stderr, "[asr] prefill chunk %d/%d: tokens [%d,%d)\n",
+                             (chunk_start / kPrefillBatch) + 1,
+                             (N + kPrefillBatch - 1) / kPrefillBatch,
+                             chunk_start, kv_new);
+            }
+        }
     }
     if (p.verbose) std::fprintf(stderr, "[asr] prefill %d tokens done\n", N);
 
     // ---- 8. greedy decode ----
     std::vector<int> generated;
-    std::vector<float> hidden_last(hidden);
-    std::memcpy(hidden_last.data(),
-                hidden_states_full.data() + hidden * (N - 1),
-                sizeof(float) * hidden);
     int pos = N;
 
     // Per-token penalty for previously generated ids (incl. prompt).

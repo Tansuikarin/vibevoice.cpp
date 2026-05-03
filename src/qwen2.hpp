@@ -27,6 +27,13 @@ struct Qwen2Hparams {
     int   intermediate_size = 0;
     float rope_theta        = 1.0e6f;
     float rms_norm_eps      = 1.0e-6f;
+
+    // When true, use ggml_flash_attn_ext instead of materializing the
+    // [seq_kv, seq_q, n_h] attention scores tensor. Required for long
+    // prefills (audio prefix) on backends that support it; the eager
+    // mul_mat -> soft_max -> mul_mat path stays as the fallback.
+    // Caller must build mask as F16 (FA contract); the eager path uses F32.
+    bool  use_flash_attn    = false;
 };
 
 struct Qwen2LayerWeights {

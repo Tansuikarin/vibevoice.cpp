@@ -55,6 +55,15 @@ bool compute_graph(ggml_cgraph* graph);
 // ggml_backend_buffer_free.
 ggml_backend_buffer_t allocate_ctx_tensors(ggml_context* ctx);
 
+// Returns true if the active backend can execute ggml_flash_attn_ext
+// natively (i.e. without per-op CPU fallback that would force HtoD/DtoH
+// copies inside the prefill loop). Result is cached on first call.
+//
+// Set VIBEVOICE_FLASH_ATTN=0 to force-disable flash attention even when
+// the backend supports it (useful for A/B'ing or when an upstream
+// regression breaks our shapes).
+bool backend_supports_flash_attn();
+
 }  // namespace vv
 
 #endif  // VIBEVOICE_BACKEND_HPP
