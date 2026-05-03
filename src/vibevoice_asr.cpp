@@ -480,8 +480,24 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
     // Both fall back gracefully: FA -> eager (set VIBEVOICE_FLASH_ATTN=0
     // or just run on a backend that doesn't advertise the op), chunked ->
     // single-shot (set VIBEVOICE_PREFILL_BATCH >= N).
-    std::vector<LayerKV> kv_lm(cfg.n_layers_lm);
-    std::vector<float>   hidden_last(hidden);
+    // Resident K/V cache lives on the active backend's buffer for the
+    // whole transcribe() call - prefill and decode both write into it
+    // via ggml_cpy, no host round-trip. Sized to fit the prefix plus the
+    // entire decode budget. See tests/test_qwen2_resident.cpp for the
+    // parity proof (one-graph 28-layer is bit-exact between classic
+    // and resident on eager, and within fp16 noise on FA).
+    ResidentKV kv_lm;
+    {
+        const int max_seq_total = N + p.max_new_tokens + 32;
+        if (!kv_lm.init(cfg.n_layers_lm, cfg.head_dim, cfg.n_kv_heads,
+                              max_seq_total)) {
+            VV_LOG_ERROR("asr: failed to allocate resident K/V cache "
+                         "(layers=%d max_seq=%d)",
+                         cfg.n_layers_lm, max_seq_total);
+            return -10;
+        }
+    }
+    std::vector<float> hidden_last(hidden);
 
     {
         Qwen2Hparams hp;
@@ -493,39 +509,20 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
         hp.rms_norm_eps   = cfg.rms_norm_eps;
         hp.use_flash_attn = vv::backend_supports_flash_attn();
 
-        // Default chunk size = 512 unconditionally. Even with FA, an
-        // N=7500 single-shot prefill blew up ggml's activation pool
-        // (~101 GB intermediate observed empirically), so chunking is
-        // not optional for long audios. 512 keeps the eager
-        // [seq_kv, seq_q, n_h] scores tensor under ~430 MB F32 in the
-        // no-FA fallback, and on the FA path makes the per-chunk
-        // gallocr peak roughly proportional to chunk_K * past * hd.
-        // VIBEVOICE_PREFILL_BATCH overrides if you want to A/B.
         const char* env_batch = std::getenv("VIBEVOICE_PREFILL_BATCH");
         int kPrefillBatch = (env_batch && std::atoi(env_batch) > 0)
                             ? std::atoi(env_batch) : 512;
         if (kPrefillBatch > N) kPrefillBatch = N;
 
-        const int hd = cfg.head_dim, n_kv = cfg.n_kv_heads;
-
         if (p.verbose) {
             std::fprintf(stderr,
-                         "[asr] prefill: N=%d batch=%d flash_attn=%s\n",
+                         "[asr] prefill: N=%d batch=%d flash_attn=%s "
+                         "(resident KV)\n",
                          N, kPrefillBatch, hp.use_flash_attn ? "yes" : "no");
-        }
-
-        // Pre-size each layer's K/V buffer so we can write directly at
-        // the right offsets without per-chunk vector resizing.
-        for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-            const size_t per = static_cast<size_t>(hd) * n_kv * N;
-            kv_lm[li].k.assign(per, 0.0f);
-            kv_lm[li].v.assign(per, 0.0f);
-            kv_lm[li].past_len = 0;
         }
 
         for (int chunk_start = 0; chunk_start < N; chunk_start += kPrefillBatch) {
             const int chunk_K = std::min(kPrefillBatch, N - chunk_start);
-            const int kv_old  = chunk_start;          // length of past K/V
             const int kv_new  = chunk_start + chunk_K;
 
             struct ggml_init_params ip {};
@@ -539,46 +536,40 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
             ggml_set_name(x, "prefill_x");
             struct ggml_tensor* posv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, chunk_K);
             ggml_set_name(posv, "prefill_pos");
-
-            // FA contract requires F16; the eager path accepts F16 too, so
-            // we always use F16 to keep one mask format across both paths.
             struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
                                                           kv_new, chunk_K);
             ggml_set_name(mask, "prefill_mask");
 
-            // Per-layer past K/V tensors (null on the first chunk).
-            std::vector<struct ggml_tensor*> k_pasts(w.lm_layers.size(), nullptr),
-                                             v_pasts(w.lm_layers.size(), nullptr);
-            if (kv_old > 0) {
-                for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-                    k_pasts[li] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
-                                                     hd, n_kv, kv_old, 1);
-                    v_pasts[li] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
-                                                     hd, n_kv, kv_old, 1);
-                }
-            }
+            kv_lm.past_len = chunk_start;
 
             struct ggml_tensor* h = x;
-            std::vector<struct ggml_tensor*> k_news(w.lm_layers.size()),
-                                             v_news(w.lm_layers.size());
+            std::vector<struct ggml_tensor*> k_writes(w.lm_layers.size()),
+                                             v_writes(w.lm_layers.size());
             for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-                auto out = qwen2_layer_forward(ctx, h, posv, mask,
-                                               k_pasts[li], v_pasts[li],
-                                               w.lm_layers[li], hp);
+                auto out = qwen2_layer_forward_resident(ctx, h, posv, mask,
+                                                        kv_lm,
+                                                        static_cast<int>(li),
+                                                        w.lm_layers[li], hp);
                 h = out.y;
-                k_news[li] = out.k_full;
-                v_news[li] = out.v_full;
+                k_writes[li] = out.k_write;
+                v_writes[li] = out.v_write;
             }
-            // Final RMSNorm only matters for the last chunk - cheap, leave
-            // it on every chunk so the graph shape stays stable across
-            // gallocr's reuse pool.
             if (w.tlm_output_norm) {
                 h = rms_norm(ctx, h, w.tlm_output_norm, cfg.rms_norm_eps);
             }
             struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
+            // Interleave k/v cpys per layer (NOT all k_writes then all
+            // v_writes). Expanding k_writes[li+1] transitively pulls in
+            // layer-li's attention chain, which reads v_full_li - so
+            // cpy_v_li must already be in the graph by then or the read
+            // gets stale V. Verified by tests/test_qwen2_resident
+            // chain28 one-graph case: bit-exact 0.000e+00 with
+            // interleaving, ~28 max_abs (catastrophic) without.
+            for (size_t li = 0; li < w.lm_layers.size(); ++li) {
+                ggml_build_forward_expand(gf, k_writes[li]);
+                ggml_build_forward_expand(gf, v_writes[li]);
+            }
             ggml_build_forward_expand(gf, h);
-            for (auto* t : k_news) ggml_build_forward_expand(gf, t);
-            for (auto* t : v_news) ggml_build_forward_expand(gf, t);
 
             ggml_backend_buffer_t in_buf = vv::allocate_ctx_tensors(ctx);
             if (!in_buf) { ggml_free(ctx); return -10; }
@@ -592,8 +583,6 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
             ggml_backend_tensor_set(posv, pos_v.data(), 0,
                                     sizeof(int32_t) * chunk_K);
 
-            // Causal mask: query at chunk_start+q can attend to keys at
-            // [0, chunk_start+q]. Mask is F16 row-major [kv_new, chunk_K].
             std::vector<ggml_fp16_t> mask_v(static_cast<size_t>(kv_new) * chunk_K);
             const ggml_fp16_t f16_zero = ggml_fp32_to_fp16(0.0f);
             const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
@@ -607,43 +596,19 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
             ggml_backend_tensor_set(mask, mask_v.data(), 0,
                                     sizeof(ggml_fp16_t) * mask_v.size());
 
-            if (kv_old > 0) {
-                for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-                    const size_t per = static_cast<size_t>(hd) * n_kv * kv_old;
-                    ggml_backend_tensor_set(k_pasts[li], kv_lm[li].k.data(),
-                                            0, sizeof(float) * per);
-                    ggml_backend_tensor_set(v_pasts[li], kv_lm[li].v.data(),
-                                            0, sizeof(float) * per);
-                }
-            }
-
             if (!vv::compute_graph(gf)) {
                 ggml_backend_buffer_free(in_buf);
                 ggml_free(ctx);
                 return -10;
             }
 
-            // Capture the last chunk's last hidden state - that's what
-            // greedy decode bootstraps from.
             if (chunk_start + chunk_K == N) {
                 ggml_backend_tensor_get(h, hidden_last.data(),
                     sizeof(float) * hidden * (chunk_K - 1),
                     sizeof(float) * hidden);
             }
 
-            // Pull only the new K/V rows (offset past kv_old) and stash
-            // them at [kv_old, kv_new) inside the per-layer cache.
-            const size_t per_old = static_cast<size_t>(hd) * n_kv * kv_old;
-            const size_t per_new = static_cast<size_t>(hd) * n_kv * chunk_K;
-            for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-                ggml_backend_tensor_get(k_news[li],
-                    kv_lm[li].k.data() + per_old,
-                    sizeof(float) * per_old, sizeof(float) * per_new);
-                ggml_backend_tensor_get(v_news[li],
-                    kv_lm[li].v.data() + per_old,
-                    sizeof(float) * per_old, sizeof(float) * per_new);
-                kv_lm[li].past_len = kv_new;
-            }
+            kv_lm.past_len = kv_new;
 
             ggml_backend_buffer_free(in_buf);
             ggml_free(ctx);
@@ -655,6 +620,7 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
                              chunk_start, kv_new);
             }
         }
+
     }
     if (p.verbose) std::fprintf(stderr, "[asr] prefill %d tokens done\n", N);
 
@@ -735,14 +701,15 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
             for (int i = 0; i < hidden; ++i) emb[i] = ggml_fp16_to_fp32(src[i]);
         }
 
+        // Single-token decode against the resident K/V cache. Same
+        // pattern as the prefill chunk loop, just with chunk_K=1.
         Qwen2Hparams hp;
-        hp.hidden_size  = hidden; hp.n_heads = cfg.n_heads; hp.n_kv_heads = cfg.n_kv_heads;
-        hp.head_dim     = cfg.head_dim; hp.rope_theta = cfg.rope_theta;
-        hp.rms_norm_eps = cfg.rms_norm_eps;
-        // Each decode step is a single-token graph attending over the
-        // full prefix + already-generated tokens. K/V cache reads here
-        // dominate per-step latency on long audios; FA halves that
-        // bandwidth and is a strict win when the backend supports it.
+        hp.hidden_size    = hidden;
+        hp.n_heads        = cfg.n_heads;
+        hp.n_kv_heads     = cfg.n_kv_heads;
+        hp.head_dim       = cfg.head_dim;
+        hp.rope_theta     = cfg.rope_theta;
+        hp.rms_norm_eps   = cfg.rms_norm_eps;
         hp.use_flash_attn = vv::backend_supports_flash_attn();
 
         struct ggml_init_params ip {};
@@ -751,39 +718,34 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
         ip.no_alloc = true;
         struct ggml_context* ctx = ggml_init(ip);
 
-        const int kv_old = kv_lm[0].past_len;
-        const int kv_new = kv_old + 1;
-        const int hd = cfg.head_dim, n_kv = cfg.n_kv_heads;
+        const int kv_new = kv_lm.past_len + 1;
 
         struct ggml_tensor* x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, 1, 1);
         struct ggml_tensor* posv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        // F16 mask: required by ggml_flash_attn_ext, also accepted by
-        // the eager soft_max_ext fallback - one format covers both.
         struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_new, 1);
-        std::vector<struct ggml_tensor*> k_pasts(w.lm_layers.size()),
-                                         v_pasts(w.lm_layers.size()),
-                                         k_news(w.lm_layers.size()),
-                                         v_news(w.lm_layers.size());
-        for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-            k_pasts[li] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, n_kv, kv_old, 1);
-            v_pasts[li] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, n_kv, kv_old, 1);
-        }
 
         struct ggml_tensor* h = x;
+        std::vector<struct ggml_tensor*> k_writes(w.lm_layers.size()),
+                                         v_writes(w.lm_layers.size());
         for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-            auto out = qwen2_layer_forward(ctx, h, posv, mask, k_pasts[li], v_pasts[li],
-                                           w.lm_layers[li], hp);
+            auto out = qwen2_layer_forward_resident(ctx, h, posv, mask,
+                                                    kv_lm, static_cast<int>(li),
+                                                    w.lm_layers[li], hp);
             h = out.y;
-            k_news[li] = out.k_full;
-            v_news[li] = out.v_full;
+            k_writes[li] = out.k_write;
+            v_writes[li] = out.v_write;
         }
         if (w.tlm_output_norm) {
             h = rms_norm(ctx, h, w.tlm_output_norm, cfg.rms_norm_eps);
         }
         struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 32768, false);
+        // Interleave k/v cpys per layer - see the prefill loop comment for
+        // the rationale.
+        for (size_t li = 0; li < w.lm_layers.size(); ++li) {
+            ggml_build_forward_expand(gf, k_writes[li]);
+            ggml_build_forward_expand(gf, v_writes[li]);
+        }
         ggml_build_forward_expand(gf, h);
-        for (auto* t : k_news) ggml_build_forward_expand(gf, t);
-        for (auto* t : v_news) ggml_build_forward_expand(gf, t);
 
         ggml_backend_buffer_t in_buf = vv::allocate_ctx_tensors(ctx);
         if (!in_buf) { ggml_free(ctx); return -11; }
@@ -795,31 +757,14 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
         const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
         for (int j = 0; j < kv_new; ++j) mask_v[j] = (j > pos) ? f16_ninf : f16_zero;
         ggml_backend_tensor_set(mask, mask_v.data(), 0, sizeof(ggml_fp16_t) * kv_new);
-        for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-            const size_t per = static_cast<size_t>(hd) * n_kv * kv_old;
-            ggml_backend_tensor_set(k_pasts[li], kv_lm[li].k.data(), 0, sizeof(float) * per);
-            ggml_backend_tensor_set(v_pasts[li], kv_lm[li].v.data(), 0, sizeof(float) * per);
-        }
 
         if (!vv::compute_graph(gf)) {
             ggml_backend_buffer_free(in_buf); ggml_free(ctx); return -11;
         }
 
         ggml_backend_tensor_get(h, hidden_last.data(), 0, sizeof(float) * hidden);
-        for (size_t li = 0; li < w.lm_layers.size(); ++li) {
-            const size_t per_full = static_cast<size_t>(hd) * n_kv * kv_new;
-            std::vector<float> kf(per_full), vf(per_full);
-            ggml_backend_tensor_get(k_news[li], kf.data(), 0, sizeof(float) * per_full);
-            ggml_backend_tensor_get(v_news[li], vf.data(), 0, sizeof(float) * per_full);
-            const size_t per_tok = static_cast<size_t>(hd) * n_kv;
-            kv_lm[li].k.insert(kv_lm[li].k.end(),
-                               kf.begin() + per_tok * kv_old,
-                               kf.begin() + per_tok * kv_new);
-            kv_lm[li].v.insert(kv_lm[li].v.end(),
-                               vf.begin() + per_tok * kv_old,
-                               vf.begin() + per_tok * kv_new);
-            kv_lm[li].past_len = kv_new;
-        }
+        kv_lm.past_len = kv_new;
+
         ggml_backend_buffer_free(in_buf);
         ggml_free(ctx);
         ++pos;

@@ -307,6 +307,105 @@ int main() {
         }
     }
 
+    // ---- E') 28 LAYERS IN ONE GRAPH ----
+    // This is the exact pattern the ASR prefill uses: build a single
+    // ggml graph where 28 layer-forwards (each writing to its own
+    // resident.k[li]/v[li] slot) execute in sequence. cpys for all
+    // layers are expanded BEFORE the final hidden, mirroring the
+    // production caller.
+    constexpr int LAYERS_PER_GRAPH = 28;
+    std::vector<float> y_inonegraph_classic;
+    {
+        // Reference: use the (host-resident) classic path with no past,
+        // chained N=LAYERS_PER_GRAPH times in separate graphs (proven
+        // identical to a single combined graph by transitivity).
+        std::vector<float> h(input, input + static_cast<size_t>(hp.hidden_size) * seq * batch);
+        for (int d = 0; d < LAYERS_PER_GRAPH; ++d) {
+            std::vector<float> out;
+            if (!run_classic(hp, w, h.data(), pos_ids, seq, batch, &out)) {
+                std::fprintf(stderr, "FAIL: classic ref layer %d\n", d); return 21;
+            }
+            h.swap(out);
+        }
+        y_inonegraph_classic.swap(h);
+    }
+    std::vector<float> y_inonegraph_resident(static_cast<size_t>(hp.hidden_size) * seq * batch);
+    {
+        vv::ResidentKV kv;
+        if (!kv.init(LAYERS_PER_GRAPH, hp.head_dim, hp.n_kv_heads, seq + 16)) {
+            std::fprintf(stderr, "FAIL: ResidentKV.init (one-graph)\n"); return 22;
+        }
+        kv.past_len = 0;
+
+        // Build ONE big graph with LAYERS_PER_GRAPH layer-forwards.
+        struct ggml_init_params ip {};
+        ip.mem_size = ggml_tensor_overhead() * 65536
+                    + ggml_graph_overhead_custom(65536, false);
+        ip.no_alloc = true;
+        struct ggml_context* ctx = ggml_init(ip);
+        if (!ctx) { std::fprintf(stderr, "FAIL: ctx init\n"); return 23; }
+
+        struct ggml_tensor* x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hp.hidden_size, seq, batch);
+        struct ggml_tensor* posv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seq);
+        struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, seq, seq);
+
+        struct ggml_tensor* h = x;
+        std::vector<struct ggml_tensor*> k_writes(LAYERS_PER_GRAPH),
+                                         v_writes(LAYERS_PER_GRAPH);
+        for (int d = 0; d < LAYERS_PER_GRAPH; ++d) {
+            auto out = vv::qwen2_layer_forward_resident(ctx, h, posv, mask,
+                                                        kv, d, w, hp);
+            h = out.y;
+            k_writes[d] = out.k_write;
+            v_writes[d] = out.v_write;
+        }
+
+        struct ggml_cgraph* gf = ggml_new_graph_custom(ctx, 65536, false);
+        // Interleave k/v cpys per layer. If we did all k_writes first then
+        // all v_writes, expanding k_writes[1] would transitively pull in
+        // layer-0 attention - which reads v_full_0 - BEFORE cpy_v_0 was
+        // added to the graph, so attention_0 would see stale V.
+        for (int d = 0; d < LAYERS_PER_GRAPH; ++d) {
+            ggml_build_forward_expand(gf, k_writes[d]);
+            ggml_build_forward_expand(gf, v_writes[d]);
+        }
+        ggml_build_forward_expand(gf, h);
+
+        ggml_backend_buffer_t buf = vv::allocate_ctx_tensors(ctx);
+        if (!buf) { ggml_free(ctx); std::fprintf(stderr, "FAIL: alloc one-graph\n"); return 24; }
+
+        ggml_backend_tensor_set(x, input, 0,
+                                sizeof(float) * hp.hidden_size * seq * batch);
+        ggml_backend_tensor_set(posv, pos_ids, 0, sizeof(int32_t) * seq);
+        std::vector<ggml_fp16_t> mask_v(static_cast<size_t>(seq) * seq);
+        const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t n = ggml_fp32_to_fp16(-INFINITY);
+        for (int i = 0; i < seq; ++i)
+            for (int j = 0; j < seq; ++j)
+                mask_v[i * seq + j] = (j > i) ? n : z;
+        ggml_backend_tensor_set(mask, mask_v.data(), 0, sizeof(ggml_fp16_t) * mask_v.size());
+
+        if (!vv::compute_graph(gf)) {
+            ggml_backend_buffer_free(buf); ggml_free(ctx);
+            std::fprintf(stderr, "FAIL: compute one-graph\n"); return 25;
+        }
+
+        ggml_backend_tensor_get(h, y_inonegraph_resident.data(), 0,
+                                sizeof(float) * y_inonegraph_resident.size());
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+    const double tol_one_graph = hp.use_flash_attn ? 1e-1 : 1e-4;
+    const double d_one_graph = max_abs_diff(y_inonegraph_classic, y_inonegraph_resident);
+    std::printf("  chain%d  one-graph resident:    max_abs=%.3e (tol=%.0e)\n",
+                LAYERS_PER_GRAPH, d_one_graph, tol_one_graph);
+    if (d_one_graph > tol_one_graph) {
+        std::fprintf(stderr,
+            "FAIL: one-graph 28-layer resident diverges from classic (%.3e > %.0e)\n",
+            d_one_graph, tol_one_graph);
+        return 26;
+    }
+
     // ---- E) DEPTH-stacked classic vs resident chunks ----
     // Chains the same fixture layer DEPTH times, threading hidden through.
     // Both paths use exactly the same kernel for each layer; the resident
