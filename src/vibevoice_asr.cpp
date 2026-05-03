@@ -743,6 +743,11 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
         hp.hidden_size  = hidden; hp.n_heads = cfg.n_heads; hp.n_kv_heads = cfg.n_kv_heads;
         hp.head_dim     = cfg.head_dim; hp.rope_theta = cfg.rope_theta;
         hp.rms_norm_eps = cfg.rms_norm_eps;
+        // Each decode step is a single-token graph attending over the
+        // full prefix + already-generated tokens. K/V cache reads here
+        // dominate per-step latency on long audios; FA halves that
+        // bandwidth and is a strict win when the backend supports it.
+        hp.use_flash_attn = vv::backend_supports_flash_attn();
 
         struct ggml_init_params ip {};
         ip.mem_size = ggml_tensor_overhead() * 32768
@@ -756,7 +761,9 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
 
         struct ggml_tensor* x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, 1, 1);
         struct ggml_tensor* posv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv_new, 1);
+        // F16 mask: required by ggml_flash_attn_ext, also accepted by
+        // the eager soft_max_ext fallback - one format covers both.
+        struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_new, 1);
         std::vector<struct ggml_tensor*> k_pasts(w.lm_layers.size()),
                                          v_pasts(w.lm_layers.size()),
                                          k_news(w.lm_layers.size()),
@@ -787,9 +794,11 @@ int vibevoice_asr_transcribe(VibeVoiceModel*           model,
         ggml_backend_tensor_set(x, emb.data(), 0, sizeof(float) * hidden);
         const int32_t pos_v = pos;
         ggml_backend_tensor_set(posv, &pos_v, 0, sizeof(int32_t));
-        std::vector<float> mask_v(kv_new);
-        for (int j = 0; j < kv_new; ++j) mask_v[j] = (j > pos) ? -INFINITY : 0.0f;
-        ggml_backend_tensor_set(mask, mask_v.data(), 0, sizeof(float) * kv_new);
+        std::vector<ggml_fp16_t> mask_v(kv_new);
+        const ggml_fp16_t f16_zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
+        for (int j = 0; j < kv_new; ++j) mask_v[j] = (j > pos) ? f16_ninf : f16_zero;
+        ggml_backend_tensor_set(mask, mask_v.data(), 0, sizeof(ggml_fp16_t) * kv_new);
         for (size_t li = 0; li < w.lm_layers.size(); ++li) {
             const size_t per = static_cast<size_t>(hd) * n_kv * kv_old;
             ggml_backend_tensor_set(k_pasts[li], kv_lm[li].k.data(), 0, sizeof(float) * per);

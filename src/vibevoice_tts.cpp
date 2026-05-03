@@ -356,6 +356,11 @@ bool run_qwen2_stack(struct ggml_context* /*ctx_ext*/,
     hp.intermediate_size = 0;  // not used (mlp uses ffn_gate weight shape directly)
     hp.rope_theta        = cfg.rope_theta;
     hp.rms_norm_eps      = cfg.rms_norm_eps;
+    // Use flash attention when the active backend supports it. TTS calls
+    // this with small per-step windows (5 text tokens or 1 speech frame),
+    // but the K/V cache grows over the full utterance, so FA's bandwidth
+    // savings on K/V reads pay off in long generations as well.
+    hp.use_flash_attn    = vv::backend_supports_flash_attn();
 
     const int kv_len_old = caches->empty() ? 0 : caches->front().past_len;
     const int kv_len_new = kv_len_old + n_new_tokens;
@@ -371,7 +376,9 @@ bool run_qwen2_stack(struct ggml_context* /*ctx_ext*/,
 
     struct ggml_tensor* x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, n_new_tokens, 1);
     struct ggml_tensor* pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_new_tokens);
-    struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kv_len_new, n_new_tokens);
+    // Mask is F16: required by ggml_flash_attn_ext, accepted by the eager
+    // soft_max_ext fallback. One format works for both branches.
+    struct ggml_tensor* mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_len_new, n_new_tokens);
     std::vector<struct ggml_tensor*> k_pasts(layers.size()), v_pasts(layers.size()),
                                      k_news(layers.size()),  v_news(layers.size());
     for (size_t li = 0; li < layers.size(); ++li) {
@@ -407,14 +414,16 @@ bool run_qwen2_stack(struct ggml_context* /*ctx_ext*/,
     std::vector<int32_t> pos_v(n_new_tokens);
     for (int i = 0; i < n_new_tokens; ++i) pos_v[i] = pos_start + i;
     ggml_backend_tensor_set(pos, pos_v.data(), 0, sizeof(int32_t) * n_new_tokens);
-    std::vector<float> mask_v(static_cast<size_t>(kv_len_new) * n_new_tokens);
+    std::vector<ggml_fp16_t> mask_v(static_cast<size_t>(kv_len_new) * n_new_tokens);
+    const ggml_fp16_t f16_zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t f16_ninf = ggml_fp32_to_fp16(-INFINITY);
     for (int i = 0; i < n_new_tokens; ++i) {
         const int qabs = pos_start + i;
         for (int j = 0; j < kv_len_new; ++j) {
-            mask_v[i * kv_len_new + j] = (j > qabs) ? -INFINITY : 0.0f;
+            mask_v[i * kv_len_new + j] = (j > qabs) ? f16_ninf : f16_zero;
         }
     }
-    ggml_backend_tensor_set(mask, mask_v.data(), 0, sizeof(float) * mask_v.size());
+    ggml_backend_tensor_set(mask, mask_v.data(), 0, sizeof(ggml_fp16_t) * mask_v.size());
     if (kv_len_old > 0) {
         for (size_t li = 0; li < layers.size(); ++li) {
             const size_t per = static_cast<size_t>(hd) * n_kv * kv_len_old;
