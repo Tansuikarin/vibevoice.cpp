@@ -1,0 +1,58 @@
+name: Build Windows CUDA (Jimver)
+
+on:
+  workflow_dispatch: # 支持手动触发
+  push:
+    branches: [ master ] # 每次推送到 master 分支时自动编译
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit
+        # 使用 Jimver 的 Action 安装 CUDA
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: '13.2.0' # 建议使用 12.2 或 12.4，稳定性较好
+          method: 'network' # 网络安装，也可以选 'local'
+          # 以下是可选组件，减少安装体积提高速度
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+
+      - name: Configure CMake
+        # Windows PowerShell 环境下使用 ` 作为换行符
+        # -DGGML_CUDA=ON 激活 GPU 支持
+        run: |
+          cmake -B build `
+            -DGGML_CUDA=ON `
+            -DVIBEVOICE_BUILD_TESTS=OFF `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DVIBEVOICE_SHARED=ON
+
+      - name: Build
+        run: |
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Verify Build
+        run: |
+          if (Test-Path "build/bin/Release/vibevoice-cli.exe") {
+            echo "Build successful!"
+            ls build/bin/Release/
+          } else {
+            echo "Build failed: vibevoice-cli.exe not found"
+            exit 1
+          }
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibevoice-windows-cuda-v12.2
+          path: |
+            build/bin/Release/*.exe
+            build/bin/Release/*.dll
