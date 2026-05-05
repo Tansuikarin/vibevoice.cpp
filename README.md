@@ -146,6 +146,20 @@ runtime voice cloning on the 1.5B path. The CLI dispatches based on
 the loaded gguf's variant metadata; the two flags are mutually
 exclusive.
 
+**Multi-speaker dialog** (1.5B only): repeat `--ref-audio` per speaker
+and tag the lines with `Speaker N:` markers. The model uses each
+WAV's encoded features as the voice for the corresponding speaker.
+
+```bash
+./build/bin/vibevoice-cli tts \
+  --model     models/vibevoice-1.5B-q8_0.gguf \
+  --tokenizer models/tokenizer.gguf \
+  --ref-audio voice-carter.wav \
+  --ref-audio voice-emma.wav \
+  --text "$(printf ' Speaker 0: Hello, I am Carter.\n Speaker 1: And I am Emma.\n Speaker 0: Nice to meet you.')" \
+  --out dialog.wav
+```
+
 Note: voice cloning **only** works with the 1.5B variant. The
 realtime-0.5B weights ship without encoders, so they can't process a
 reference WAV at runtime — they only consume pre-baked voice gguf

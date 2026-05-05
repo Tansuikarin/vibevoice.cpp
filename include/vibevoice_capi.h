@@ -46,23 +46,29 @@ int vv_capi_load(const char* tts_model_path,
 // path is selected by the loaded model's variant:
 //
 //   * realtime-0.5b -> uses `voice_path` (a pre-baked voice gguf).
-//                      `ref_audio_path` must be NULL.
-//   * 1.5b          -> uses `ref_audio_path` (raw 24 kHz mono WAV
-//                      conditioning the synthesis at run-time, i.e.
-//                      runtime voice cloning). `voice_path` must be NULL.
+//                      `ref_audio_paths` must be NULL / n_ref_audio == 0.
+//   * 1.5b          -> uses `ref_audio_paths` — one WAV per speaker,
+//                      24 kHz mono. `n_ref_audio_paths` is the number
+//                      of distinct speakers (>= 1; the dialog in `text`
+//                      can reference Speaker 0 .. n-1). `voice_path`
+//                      must be NULL.
 //
-// Either of voice_path / ref_audio_path may be NULL when a value was
-// already supplied to vv_capi_load. n_diffusion_steps == 0 -> 20,
-// cfg_scale == 0 -> 1.3 (1.0 disables CFG), max_speech_frames == 0
-// -> 200, seed == 0 -> random.
-int vv_capi_tts(const char* text,
-                const char* voice_path,
-                const char* ref_audio_path,
-                const char* dst_wav_path,
-                int         n_diffusion_steps,
-                float       cfg_scale,
-                int         max_speech_frames,
-                uint32_t    seed);
+// `text` is either a plain sentence (single-speaker convenience —
+// auto-wrapped as "Speaker 0: ...") or speaker-tagged dialog with one
+// "Speaker N:" line per turn (passed through verbatim).
+//
+// `voice_path` may be NULL if already supplied to vv_capi_load.
+// n_diffusion_steps == 0 -> 20, cfg_scale == 0 -> 1.3 (1.0 disables
+// CFG), max_speech_frames == 0 -> 200, seed == 0 -> random.
+int vv_capi_tts(const char*        text,
+                const char*        voice_path,
+                const char* const* ref_audio_paths,
+                int                n_ref_audio_paths,
+                const char*        dst_wav_path,
+                int                n_diffusion_steps,
+                float              cfg_scale,
+                int                max_speech_frames,
+                uint32_t           seed);
 
 // Transcribe `src_wav_path` into a JSON string written into the caller-
 // owned `out_json` buffer of size `out_capacity`. The JSON is the same

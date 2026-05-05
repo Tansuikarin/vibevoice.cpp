@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <regex>
 #include <string>
 
 namespace vv {
@@ -618,7 +619,6 @@ std::vector<float> decode_latent_sequence(const VibeVoiceConfig&  cfg,
 // Forward declaration — implementation later in this file.
 namespace {
 int tts_15b_generate(VibeVoiceModel*            model,
-                     const std::string&         ref_wav_path,
                      const std::string&         text,
                      const VibeVoiceTTSParams&  p,
                      std::vector<float>*        samples);
@@ -633,12 +633,13 @@ int vibevoice_tts_generate(VibeVoiceModel*           model,
     // Variant dispatch — the gguf already knows which path it wants;
     // callers don't need a separate entry point per model family.
     if (model->variant == "1.5b") {
-        if (p.ref_audio_path.empty()) {
+        if (p.ref_audio_paths.empty()) {
             VV_LOG_ERROR("vibevoice_tts_generate: 1.5b model requires "
-                         "VibeVoiceTTSParams::ref_audio_path");
+                         "at least one VibeVoiceTTSParams::ref_audio_paths "
+                         "entry (single-speaker: pass a one-element vector)");
             return -1;
         }
-        return tts_15b_generate(model, p.ref_audio_path, text, p, samples);
+        return tts_15b_generate(model, text, p, samples);
     }
 
     const auto& cfg = model->cfg;
@@ -964,26 +965,54 @@ constexpr int kSpeech15bDiffId  = 151654;  // <|vision_pad|>
 constexpr int kSpeech15bImgPadId = 151655; // <|image_pad|> — negative branch
 constexpr int kSpeech15bCompressRatio = 3200;
 
+// Returns true if `text` already contains a "Speaker N:" line marker
+// anywhere — in which case the caller wants the multi-speaker dialog
+// passed through verbatim. Otherwise we wrap the whole thing as a
+// single Speaker 0 line.
+bool text_has_speaker_prefix(const std::string& text) {
+    static const std::regex re(R"(\bSpeaker\s+\d+\s*:)",
+                                std::regex::ECMAScript);
+    return std::regex_search(text, re);
+}
+
 // Build the 1.5B prompt as a literal byte-BPE string. The tokenizer's
 // special-token matching rewrites the bracketed markers into single token
 // IDs (151652 / 151653 / 151654 etc.) while the rest is regular text.
 //
 // Mirrors `VibeVoiceProcessor._create_voice_prompt` +
-// `VibeVoiceProcessor.__call__` from the upstream reference repo.
-std::string build_prompt_15b(int vae_tok_len, const std::string& text) {
+// `VibeVoiceProcessor.__call__` from the upstream reference repo —
+// each entry in `vae_tok_lens` is one speaker's reference-audio
+// length (in compressed frames), inserted as a separate
+// "Speaker {i}: <vision_start><vision_pad>×N<vision_end>" block.
+std::string build_prompt_15b(const std::vector<int>& vae_tok_lens,
+                             const std::string& text) {
+    int total_pads = 0;
+    for (int t : vae_tok_lens) total_pads += t;
+
     std::string out;
-    out.reserve(2048 + vae_tok_len * 16);
+    out.reserve(2048 + total_pads * 16 + text.size());
     out += " Transform the text provided by various speakers into speech "
            "output, utilizing the distinct voice of each respective speaker.\n";
     out += " Voice input:\n";
-    out += " Speaker 0:";
-    out += "<|vision_start|>";
-    for (int i = 0; i < vae_tok_len; ++i) out += "<|vision_pad|>";
-    out += "<|vision_end|>\n";
+    for (size_t i = 0; i < vae_tok_lens.size(); ++i) {
+        out += " Speaker " + std::to_string(i) + ":";
+        out += "<|vision_start|>";
+        for (int j = 0; j < vae_tok_lens[i]; ++j) out += "<|vision_pad|>";
+        out += "<|vision_end|>\n";
+    }
     out += " Text input:\n";
-    out += " Speaker 0:";
-    out += text;
-    out += "\n";
+    if (text_has_speaker_prefix(text)) {
+        // User already supplied speaker-tagged dialog; pass through.
+        // Each line should begin with " Speaker N:" — we add the
+        // leading space if the user forgot it on the first line.
+        if (!text.empty() && text[0] != ' ') out += ' ';
+        out += text;
+        if (out.empty() || out.back() != '\n') out += "\n";
+    } else {
+        out += " Speaker 0:";
+        out += text;
+        out += "\n";
+    }
     out += " Speech output:\n";
     out += "<|vision_start|>";
     return out;
@@ -1012,7 +1041,6 @@ void embed_row(struct ggml_tensor* tok_embd, int id, int hidden, float* dst) {
 
 namespace {
 int tts_15b_generate(VibeVoiceModel*            model,
-                     const std::string&         ref_wav_path,
                      const std::string&         text,
                      const VibeVoiceTTSParams&  p,
                      std::vector<float>*        samples) {
@@ -1026,6 +1054,10 @@ int tts_15b_generate(VibeVoiceModel*            model,
         VV_LOG_ERROR("tts_15b: tokenizer not loaded");
         return -2;
     }
+    if (p.ref_audio_paths.empty()) {
+        VV_LOG_ERROR("tts_15b: ref_audio_paths is empty");
+        return -3;
+    }
 
     const auto& cfg = model->cfg;
     const auto& w   = model->w;
@@ -1033,68 +1065,85 @@ int tts_15b_generate(VibeVoiceModel*            model,
 
     samples->clear();
 
-    // ---- 1. load reference audio ----
-    std::vector<float> ref_audio;
-    if (load_wav_24k_mono(ref_wav_path.c_str(), &ref_audio) != 0 ||
-        ref_audio.empty()) {
-        VV_LOG_ERROR("tts_15b: failed to load reference WAV: %s",
-                     ref_wav_path.c_str());
-        return -3;
-    }
+    // ---- 1. load + encode each speaker's reference WAV -> features ----
+    // Collected back-to-back into one big speech_features buffer in
+    // speaker order (speaker 0 first, then speaker 1, ...).
+    std::vector<int>   per_speaker_Tc;
+    per_speaker_Tc.reserve(p.ref_audio_paths.size());
+    std::vector<float> speech_features;
+    int                total_Tc = 0;
 
-    // RMS-normalize to -25 dBFS, mirrors the upstream AudioNormalizer +
-    // matches what the ASR encoder expects (same encoders, same convention).
-    {
-        const float target_dB_FS = -25.0f, eps = 1e-6f;
-        double sq = 0.0;
-        for (float v : ref_audio) sq += static_cast<double>(v) * v;
-        const float rms = static_cast<float>(std::sqrt(sq / std::max<size_t>(ref_audio.size(), 1)));
-        const float target_lin = std::pow(10.0f, target_dB_FS / 20.0f);
-        const float scalar = target_lin / (rms + eps);
-        for (auto& v : ref_audio) v *= scalar;
-        float maxabs = 0.0f;
-        for (float v : ref_audio) maxabs = std::max(maxabs, std::fabs(v));
-        if (maxabs > 1.0f) {
-            const float clip_div = maxabs + eps;
-            for (auto& v : ref_audio) v /= clip_div;
+    for (size_t s = 0; s < p.ref_audio_paths.size(); ++s) {
+        const std::string& ref_wav_path = p.ref_audio_paths[s];
+
+        std::vector<float> ref_audio;
+        if (load_wav_24k_mono(ref_wav_path.c_str(), &ref_audio) != 0 ||
+            ref_audio.empty()) {
+            VV_LOG_ERROR("tts_15b: failed to load reference WAV %zu: %s",
+                         s, ref_wav_path.c_str());
+            return -3;
         }
+
+        // RMS-normalize to -25 dBFS — same convention the ASR encoder
+        // was trained against.
+        {
+            const float target_dB_FS = -25.0f, eps = 1e-6f;
+            double sq = 0.0;
+            for (float v : ref_audio) sq += static_cast<double>(v) * v;
+            const float rms = static_cast<float>(std::sqrt(sq / std::max<size_t>(ref_audio.size(), 1)));
+            const float target_lin = std::pow(10.0f, target_dB_FS / 20.0f);
+            const float scalar = target_lin / (rms + eps);
+            for (auto& v : ref_audio) v *= scalar;
+            float maxabs = 0.0f;
+            for (float v : ref_audio) maxabs = std::max(maxabs, std::fabs(v));
+            if (maxabs > 1.0f) {
+                const float clip_div = maxabs + eps;
+                for (auto& v : ref_audio) v /= clip_div;
+            }
+        }
+
+        // Acoustic + semantic encoders.
+        std::vector<float> ac_lat, sm_lat;
+        int Tc_a = 0, Tc_s = 0;
+        if (!detail::run_encoder_buf(model->at_enc, cfg.acoustic, ref_audio,
+                                      &ac_lat, &Tc_a)) return -4;
+        if (!detail::run_encoder_buf(model->st_enc, model->semantic_cfg, ref_audio,
+                                      &sm_lat, &Tc_s)) return -4;
+        if (Tc_a != Tc_s) {
+            VV_LOG_ERROR("tts_15b: encoder frame mismatch on speaker %zu (%d vs %d)",
+                         s, Tc_a, Tc_s);
+            return -5;
+        }
+        const int Tc = Tc_a;
+
+        // Connectors -> per-frame [hidden] speech features.
+        auto ac_emb = detail::run_connector(w.ac_fc1_w, w.ac_fc1_b, w.ac_norm,
+                                             w.ac_fc2_w, w.ac_fc2_b,
+                                             ac_lat, cfg.vae_dim, Tc, hidden);
+        auto sm_emb = detail::run_connector(model->sc_fc1_w, model->sc_fc1_b, model->sc_norm,
+                                             model->sc_fc2_w, model->sc_fc2_b,
+                                             sm_lat, model->semantic_vae_dim, Tc, hidden);
+        if (ac_emb.size() != sm_emb.size()
+            || ac_emb.size() != static_cast<size_t>(hidden) * Tc) {
+            VV_LOG_ERROR("tts_15b: connector output size mismatch on speaker %zu", s);
+            return -6;
+        }
+
+        const size_t base = speech_features.size();
+        speech_features.resize(base + static_cast<size_t>(hidden) * Tc);
+        for (size_t i = 0; i < ac_emb.size(); ++i) {
+            speech_features[base + i] = ac_emb[i] + sm_emb[i];
+        }
+
+        per_speaker_Tc.push_back(Tc);
+        total_Tc += Tc;
+        if (p.verbose) std::fprintf(stderr,
+            "[tts_15b] speaker %zu: ref %zu samples -> %d compressed frames\n",
+            s, ref_audio.size(), Tc);
     }
 
-    // ---- 2. acoustic + semantic encoders ----
-    std::vector<float> ac_lat, sm_lat;
-    int Tc_a = 0, Tc_s = 0;
-    if (!detail::run_encoder_buf(model->at_enc, cfg.acoustic, ref_audio,
-                                  &ac_lat, &Tc_a)) return -4;
-    if (!detail::run_encoder_buf(model->st_enc, model->semantic_cfg, ref_audio,
-                                  &sm_lat, &Tc_s)) return -4;
-    if (Tc_a != Tc_s) {
-        VV_LOG_ERROR("tts_15b: encoder frame mismatch %d vs %d", Tc_a, Tc_s);
-        return -5;
-    }
-    const int Tc = Tc_a;
-    if (p.verbose) std::fprintf(stderr,
-        "[tts_15b] ref %zu samples -> %d compressed frames\n",
-        ref_audio.size(), Tc);
-
-    // ---- 3. connectors -> per-frame speech features ----
-    auto ac_emb = detail::run_connector(w.ac_fc1_w, w.ac_fc1_b, w.ac_norm,
-                                         w.ac_fc2_w, w.ac_fc2_b,
-                                         ac_lat, cfg.vae_dim, Tc, hidden);
-    auto sm_emb = detail::run_connector(model->sc_fc1_w, model->sc_fc1_b, model->sc_norm,
-                                         model->sc_fc2_w, model->sc_fc2_b,
-                                         sm_lat, model->semantic_vae_dim, Tc, hidden);
-    if (ac_emb.size() != sm_emb.size()
-        || ac_emb.size() != static_cast<size_t>(hidden) * Tc) {
-        VV_LOG_ERROR("tts_15b: connector output size mismatch");
-        return -6;
-    }
-    std::vector<float> speech_features(static_cast<size_t>(hidden) * Tc);
-    for (size_t i = 0; i < speech_features.size(); ++i) {
-        speech_features[i] = ac_emb[i] + sm_emb[i];
-    }
-
-    // ---- 4. build prompt + tokenize ----
-    const std::string prompt = build_prompt_15b(Tc, text);
+    // ---- 2. build prompt + tokenize ----
+    const std::string prompt = build_prompt_15b(per_speaker_Tc, text);
     const auto input_ids = model->tokenizer.encode(prompt);
     if (input_ids.empty()) {
         VV_LOG_ERROR("tts_15b: tokenizer returned no tokens");
@@ -1103,20 +1152,21 @@ int tts_15b_generate(VibeVoiceModel*            model,
     const int N = static_cast<int>(input_ids.size());
 
     std::vector<int> pad_positions;
-    pad_positions.reserve(Tc);
+    pad_positions.reserve(total_Tc);
     for (int i = 0; i < N; ++i) {
         if (input_ids[i] == kSpeech15bDiffId) pad_positions.push_back(i);
     }
-    if (static_cast<int>(pad_positions.size()) != Tc) {
+    if (static_cast<int>(pad_positions.size()) != total_Tc) {
         VV_LOG_ERROR("tts_15b: prompt has %zu vision_pad tokens, want %d "
-                     "(tokenizer mis-decoding the speech markers?)",
-                     pad_positions.size(), Tc);
+                     "(sum of per-speaker frames; tokenizer mis-decoding?)",
+                     pad_positions.size(), total_Tc);
         return -8;
     }
     if (p.verbose) std::fprintf(stderr,
-        "[tts_15b] prompt %d tokens, %d are speech-pad\n", N, Tc);
+        "[tts_15b] prompt %d tokens, %d are speech-pad across %zu speaker(s)\n",
+        N, total_Tc, p.ref_audio_paths.size());
 
-    // ---- 5. embed prompt + splice speech features ----
+    // ---- 3. embed prompt + splice speech features (in speaker order) ----
     std::vector<float> embeds(static_cast<size_t>(hidden) * N);
     for (int t = 0; t < N; ++t) {
         const int id = input_ids[t];
@@ -1126,7 +1176,11 @@ int tts_15b_generate(VibeVoiceModel*            model,
         }
         embed_row(w.lm_tok_embd, id, hidden, &embeds[hidden * t]);
     }
-    for (int k = 0; k < Tc; ++k) {
+    // pad_positions is in document order, which is also speaker order
+    // (build_prompt_15b emits all of speaker 0's vision_pads first,
+    // then speaker 1's, ...). So the k-th pad gets the k-th feature
+    // row from the concatenated speech_features buffer.
+    for (int k = 0; k < total_Tc; ++k) {
         const int pos = pad_positions[k];
         std::memcpy(&embeds[static_cast<size_t>(hidden) * pos],
                     &speech_features[static_cast<size_t>(hidden) * k],
@@ -1182,12 +1236,12 @@ int tts_15b_generate(VibeVoiceModel*            model,
             VV_LOG_ERROR("tts_15b: neg KV init failed");
             return -10;
         }
-        // Copy positive embeds, then overwrite vision_pad positions
-        // with image_pad embeddings.
+        // Copy positive embeds, then overwrite every vision_pad
+        // position (across all speakers) with the image_pad embedding.
         std::vector<float> neg_embeds(embeds);
         std::vector<float> img_pad_embed(hidden);
         embed_row(w.lm_tok_embd, kSpeech15bImgPadId, hidden, img_pad_embed.data());
-        for (int k = 0; k < Tc; ++k) {
+        for (int k = 0; k < total_Tc; ++k) {
             const int pos = pad_positions[k];
             std::memcpy(&neg_embeds[static_cast<size_t>(hidden) * pos],
                         img_pad_embed.data(),

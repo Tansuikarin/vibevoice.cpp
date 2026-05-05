@@ -109,7 +109,7 @@ int main() {
         "Hello world this is a test of voice cloning.";
 
     vv::VibeVoiceTTSParams p;
-    p.ref_audio_path    = ref_wav;
+    p.ref_audio_paths   = {ref_wav};
     p.max_speech_frames = 200;
     p.n_diffusion_steps = 20;
     p.cfg_scale         = 1.3f;

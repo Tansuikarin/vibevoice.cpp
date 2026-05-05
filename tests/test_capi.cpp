@@ -81,7 +81,8 @@ int main() {
     const std::string wav    = "/tmp/vibevoice_capi_smoke.wav";
 
     rc = vv_capi_tts(source.c_str(),
-                     /*voice_path=*/nullptr, /*ref_audio_path=*/nullptr,
+                     /*voice_path=*/nullptr,
+                     /*ref_audio_paths=*/nullptr, /*n_ref=*/0,
                      wav.c_str(),
                      /*steps=*/20, /*cfg=*/1.3f,
                      /*max_speech_frames=*/200, /*seed=*/0xCAFE);
@@ -128,8 +129,10 @@ int main() {
 
         const std::string source15b = "Hello world this is a capi smoke test for runtime voice cloning.";
         const std::string wav15b    = "/tmp/vibevoice_capi_15b.wav";
+        const char* refs[1] = { ref_wav };
         rc = vv_capi_tts(source15b.c_str(),
-                         /*voice_path=*/nullptr, /*ref_audio_path=*/ref_wav,
+                         /*voice_path=*/nullptr,
+                         /*ref_audio_paths=*/refs, /*n_ref=*/1,
                          wav15b.c_str(),
                          /*steps=*/20, /*cfg_scale=*/1.3f,
                          /*max_speech_frames=*/200, /*seed=*/0xCAFE);

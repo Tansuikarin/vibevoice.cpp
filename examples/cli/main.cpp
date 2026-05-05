@@ -34,6 +34,8 @@ void print_usage(const char* argv0) {
         "                      models. Mutually exclusive with --ref-audio.\n"
         "  --ref-audio <path>  reference WAV (24 kHz mono, ~5 s) — runtime\n"
         "                      voice cloning. Use with VibeVoice-1.5B models.\n"
+        "                      Repeat per speaker for multi-speaker dialog;\n"
+        "                      `--text` then needs `Speaker N:` lines.\n"
         "                      Mutually exclusive with --voice.\n"
         "  --text <string>     input text\n"
         "  --text-file <path>  read text from file\n"
@@ -79,7 +81,8 @@ bool slurp(const std::string& path, std::string* out) {
 }
 
 int cmd_tts(int argc, char** argv) {
-    std::string model_path, tok_path, voice_path, ref_audio;
+    std::string model_path, tok_path, voice_path;
+    std::vector<std::string> ref_audio;
     std::string text, text_file, out_path = "out.wav";
     int   max_frames = 200, steps = 20;
     float cfg_scale = 1.3f;
@@ -91,7 +94,7 @@ int cmd_tts(int argc, char** argv) {
         if      (a == "--model"      && (i + 1 < argc)) { model_path = argv[++i]; }
         else if (a == "--tokenizer"  && (i + 1 < argc)) { tok_path   = argv[++i]; }
         else if (a == "--voice"      && (i + 1 < argc)) { voice_path = argv[++i]; }
-        else if (a == "--ref-audio"  && (i + 1 < argc)) { ref_audio  = argv[++i]; }
+        else if (a == "--ref-audio"  && (i + 1 < argc)) { ref_audio.emplace_back(argv[++i]); }
         else if (a == "--text"       && (i + 1 < argc)) { text       = argv[++i]; }
         else if (a == "--text-file"  && (i + 1 < argc)) { text_file  = argv[++i]; }
         else if (a == "--out"        && (i + 1 < argc)) { out_path   = argv[++i]; }
@@ -147,9 +150,10 @@ int cmd_tts(int argc, char** argv) {
     const bool is_15b = (model.variant == "1.5b");
     if (is_15b && ref_audio.empty()) {
         std::fprintf(stderr,
-                     "tts: 1.5b model requires --ref-audio (raw 24 kHz mono "
-                     "WAV). Pre-baked --voice gguf files are realtime-0.5B "
-                     "only.\n");
+                     "tts: 1.5b model requires at least one --ref-audio "
+                     "(raw 24 kHz mono WAV). Repeat --ref-audio per speaker "
+                     "for multi-speaker dialog. Pre-baked --voice gguf "
+                     "files are realtime-0.5B only.\n");
         return 1;
     }
     if (!is_15b && !ref_audio.empty()) {
@@ -179,7 +183,7 @@ int cmd_tts(int argc, char** argv) {
 
     vv::VibeVoiceTTSParams p;
     p.voice             = have_voice ? &voice : nullptr;
-    p.ref_audio_path    = ref_audio;
+    p.ref_audio_paths   = ref_audio;
     p.max_speech_frames = max_frames;
     p.n_diffusion_steps = steps;
     p.cfg_scale         = cfg_scale;

@@ -116,14 +116,15 @@ int vv_capi_load(const char* tts_model_path,
     return 0;
 }
 
-int vv_capi_tts(const char* text,
-                const char* voice_path,
-                const char* ref_audio_path,
-                const char* dst_wav_path,
-                int         n_diffusion_steps,
-                float       cfg_scale,
-                int         max_speech_frames,
-                uint32_t    seed) {
+int vv_capi_tts(const char*        text,
+                const char*        voice_path,
+                const char* const* ref_audio_paths,
+                int                n_ref_audio_paths,
+                const char*        dst_wav_path,
+                int                n_diffusion_steps,
+                float              cfg_scale,
+                int                max_speech_frames,
+                uint32_t           seed) {
     auto& g = engine();
     std::lock_guard<std::mutex> lk(g.mu);
     if (!g.tts)             return -3;
@@ -139,16 +140,22 @@ int vv_capi_tts(const char* text,
     p.verbose            = false;
 
     if (is_15b) {
-        // 1.5B path: ref_audio_path is required (per call or via load).
-        const std::string ref =
-            (ref_audio_path && ref_audio_path[0]) ? ref_audio_path
-                                                  : g.ref_audio_path_loaded;
-        if (ref.empty()) {
-            VV_LOG_ERROR("vv_capi_tts: 1.5b model needs ref_audio_path "
-                         "here or via vv_capi_load");
+        // 1.5B path: ref_audio_paths is required (per call or via load).
+        if (n_ref_audio_paths > 0 && ref_audio_paths) {
+            for (int i = 0; i < n_ref_audio_paths; ++i) {
+                if (ref_audio_paths[i] && ref_audio_paths[i][0]) {
+                    p.ref_audio_paths.emplace_back(ref_audio_paths[i]);
+                }
+            }
+        }
+        if (p.ref_audio_paths.empty() && !g.ref_audio_path_loaded.empty()) {
+            p.ref_audio_paths.push_back(g.ref_audio_path_loaded);
+        }
+        if (p.ref_audio_paths.empty()) {
+            VV_LOG_ERROR("vv_capi_tts: 1.5b model needs at least one "
+                         "ref_audio_paths entry (per-call or via vv_capi_load)");
             return -2;
         }
-        p.ref_audio_path = ref;
     } else {
         // realtime-0.5b path: voice_path required (per call or via load).
         if (voice_path && voice_path[0]) {

@@ -148,10 +148,16 @@ struct VibeVoiceTTSParams {
     // model is a 1.5b variant.
     const VibeVoiceVoice* voice = nullptr;
 
-    // 1.5b conditioning: raw reference WAV path. Encoded inline
-    // through at_enc + st_enc + connectors at synthesis time. Ignored
-    // when the model is a realtime-0.5b variant.
-    std::string ref_audio_path = "";
+    // 1.5b conditioning: one reference WAV per speaker. Each WAV is
+    // encoded inline through at_enc + st_enc + connectors at synthesis
+    // time and spliced into the prompt's Voice-input block for that
+    // speaker. Ignored when the model is a realtime-0.5b variant.
+    //
+    // Single-speaker: pass a one-element vector. Multi-speaker: pass
+    // one entry per distinct Speaker {N}: in the dialog. The user's
+    // `text` should then itself contain `Speaker 0: ...`,
+    // `Speaker 1: ...` lines (auto-wrapped as Speaker 0 if it doesn't).
+    std::vector<std::string> ref_audio_paths;
 
     int      max_speech_frames = 200;
     float    cfg_scale         = 1.3f;

@@ -59,7 +59,7 @@ int main() {
     }
 
     vv::VibeVoiceTTSParams p;
-    p.ref_audio_path    = ref_wav;
+    p.ref_audio_paths   = {ref_wav};
     p.max_speech_frames = 64;          // short — smoke only
     p.n_diffusion_steps = 10;          // fewer steps for speed
     p.cfg_scale         = 1.0f;        // no CFG yet
