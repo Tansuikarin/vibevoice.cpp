@@ -143,16 +143,28 @@ bool vibevoice_voice_load(const std::string&     path,
                           VibeVoiceVoice*        out);
 
 struct VibeVoiceTTSParams {
-    const VibeVoiceVoice* voice = nullptr;       // optional voice prompt
+    // realtime-0.5b conditioning: a pre-baked voice gguf wrapped in
+    // VibeVoiceVoice (load with vibevoice_voice_load). Ignored when the
+    // model is a 1.5b variant.
+    const VibeVoiceVoice* voice = nullptr;
+
+    // 1.5b conditioning: raw reference WAV path. Encoded inline
+    // through at_enc + st_enc + connectors at synthesis time. Ignored
+    // when the model is a realtime-0.5b variant.
+    std::string ref_audio_path = "";
+
     int      max_speech_frames = 200;
-    float    cfg_scale         = 1.3f;     // 1.0 = off; needs voice.has_neg
+    float    cfg_scale         = 1.3f;
     int      n_diffusion_steps = 20;
     uint32_t seed              = 0;
     bool     verbose           = false;
 };
 
-// Generate audio for `text`. Output samples are 24 kHz mono float32 in
-// `samples`. Returns 0 on success.
+// Generate audio for `text`. Dispatches on `model->variant`:
+//   * realtime-0.5b -> uses `p.voice` (pre-baked voice gguf state).
+//   * 1.5b          -> uses `p.ref_audio_path` (raw reference WAV;
+//                     runtime voice cloning, no separate voice gguf).
+// Output samples are 24 kHz mono float32. Returns 0 on success.
 int vibevoice_tts_generate(VibeVoiceModel*           model,
                            const std::string&        text,
                            const VibeVoiceTTSParams& p,

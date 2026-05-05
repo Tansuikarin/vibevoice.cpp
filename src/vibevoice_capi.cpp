@@ -24,6 +24,7 @@ struct GlobalEngine {
     std::unique_ptr<vv::VibeVoiceModel> asr;
     std::unique_ptr<vv::VibeVoiceVoice> voice;
     std::string                          voice_path_loaded;
+    std::string                          ref_audio_path_loaded;  // 1.5b
     int                                  n_threads = 4;
     std::mutex                           mu;
 };
@@ -117,6 +118,7 @@ int vv_capi_load(const char* tts_model_path,
 
 int vv_capi_tts(const char* text,
                 const char* voice_path,
+                const char* ref_audio_path,
                 const char* dst_wav_path,
                 int         n_diffusion_steps,
                 float       cfg_scale,
@@ -127,21 +129,38 @@ int vv_capi_tts(const char* text,
     if (!g.tts)             return -3;
     if (!text || !dst_wav_path) return -2;
 
-    if (voice_path && voice_path[0]) {
-        if (!ensure_voice_loaded(g, voice_path)) return -3;
-    }
-    if (!g.voice) {
-        VV_LOG_ERROR("vv_capi_tts: no voice loaded — pass voice_path here or to vv_capi_load");
-        return -2;
-    }
+    const bool is_15b = (g.tts->variant == "1.5b");
 
     vv::VibeVoiceTTSParams p;
-    p.voice              = g.voice.get();
     p.cfg_scale          = cfg_scale > 0.0f ? cfg_scale : 1.3f;
     p.n_diffusion_steps  = n_diffusion_steps > 0 ? n_diffusion_steps : 20;
     p.max_speech_frames  = max_speech_frames > 0 ? max_speech_frames : 200;
     p.seed               = seed;
     p.verbose            = false;
+
+    if (is_15b) {
+        // 1.5B path: ref_audio_path is required (per call or via load).
+        const std::string ref =
+            (ref_audio_path && ref_audio_path[0]) ? ref_audio_path
+                                                  : g.ref_audio_path_loaded;
+        if (ref.empty()) {
+            VV_LOG_ERROR("vv_capi_tts: 1.5b model needs ref_audio_path "
+                         "here or via vv_capi_load");
+            return -2;
+        }
+        p.ref_audio_path = ref;
+    } else {
+        // realtime-0.5b path: voice_path required (per call or via load).
+        if (voice_path && voice_path[0]) {
+            if (!ensure_voice_loaded(g, voice_path)) return -3;
+        }
+        if (!g.voice) {
+            VV_LOG_ERROR("vv_capi_tts: no voice loaded — pass voice_path "
+                         "here or to vv_capi_load");
+            return -2;
+        }
+        p.voice = g.voice.get();
+    }
 
     std::vector<float> samples;
     int rc = vv::vibevoice_tts_generate(g.tts.get(), text, p, &samples);
@@ -213,5 +232,15 @@ void vv_capi_unload(void) {
 }
 
 const char* vv_capi_version(void) { return "vibevoice.cpp 0.1.0 (capi)"; }
+
+int vv_capi_voice_clone(const char* /*src_wav_path*/,
+                        const char* /*dst_voice_gguf_path*/,
+                        int         /*with_cfg*/) {
+    VV_LOG_ERROR("vv_capi_voice_clone: not supported. The realtime-0.5B "
+                 "weights ship without encoders, so we cannot prep a voice "
+                 "gguf at runtime. Load a 1.5B gguf and pass ref_audio_path "
+                 "to vv_capi_tts for runtime voice cloning instead.");
+    return -2;
+}
 
 }  // extern "C"

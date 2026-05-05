@@ -28,15 +28,20 @@ void print_usage(const char* argv0) {
         "  help    print this message\n"
         "\n"
         "tts options:\n"
-        "  --model <path>      path to vibevoice.gguf (required)\n"
+        "  --model <path>      path to vibevoice gguf (required)\n"
         "  --tokenizer <path>  path to tokenizer.gguf (required)\n"
-        "  --voice <path>      path to voice.gguf (recommended)\n"
+        "  --voice <path>      pre-baked voice.gguf — use with realtime-0.5B\n"
+        "                      models. Mutually exclusive with --ref-audio.\n"
+        "  --ref-audio <path>  reference WAV (24 kHz mono, ~5 s) — runtime\n"
+        "                      voice cloning. Use with VibeVoice-1.5B models.\n"
+        "                      Mutually exclusive with --voice.\n"
         "  --text <string>     input text\n"
         "  --text-file <path>  read text from file\n"
         "  --out <path>        output WAV path (default: out.wav)\n"
         "  --max-frames N      cap speech frames (default 200)\n"
         "  --steps N           DPM-Solver inference steps (default 20)\n"
-        "  --cfg X             classifier-free guidance scale (default 1.3)\n"
+        "  --cfg X             classifier-free guidance scale (default 1.3,\n"
+        "                      1.0 disables CFG)\n"
         "  --seed N            RNG seed for noise (default random)\n"
         "  --verbose           print per-frame progress\n"
         "\n"
@@ -74,7 +79,8 @@ bool slurp(const std::string& path, std::string* out) {
 }
 
 int cmd_tts(int argc, char** argv) {
-    std::string model_path, tok_path, voice_path, text, text_file, out_path = "out.wav";
+    std::string model_path, tok_path, voice_path, ref_audio;
+    std::string text, text_file, out_path = "out.wav";
     int   max_frames = 200, steps = 20;
     float cfg_scale = 1.3f;
     uint32_t seed = 0;
@@ -85,6 +91,7 @@ int cmd_tts(int argc, char** argv) {
         if      (a == "--model"      && (i + 1 < argc)) { model_path = argv[++i]; }
         else if (a == "--tokenizer"  && (i + 1 < argc)) { tok_path   = argv[++i]; }
         else if (a == "--voice"      && (i + 1 < argc)) { voice_path = argv[++i]; }
+        else if (a == "--ref-audio"  && (i + 1 < argc)) { ref_audio  = argv[++i]; }
         else if (a == "--text"       && (i + 1 < argc)) { text       = argv[++i]; }
         else if (a == "--text-file"  && (i + 1 < argc)) { text_file  = argv[++i]; }
         else if (a == "--out"        && (i + 1 < argc)) { out_path   = argv[++i]; }
@@ -104,6 +111,10 @@ int cmd_tts(int argc, char** argv) {
 
     if (model_path.empty() || tok_path.empty()) {
         std::fprintf(stderr, "tts: --model and --tokenizer are required\n");
+        return 1;
+    }
+    if (!voice_path.empty() && !ref_audio.empty()) {
+        std::fprintf(stderr, "tts: --voice and --ref-audio are mutually exclusive\n");
         return 1;
     }
     if (text.empty()) {
@@ -130,23 +141,45 @@ int cmd_tts(int argc, char** argv) {
         return 3;
     }
 
+    // Validate inputs against the loaded model's variant. The gguf
+    // already says which kind of conditioning it expects; the CLI is
+    // a thin wrapper around that.
+    const bool is_15b = (model.variant == "1.5b");
+    if (is_15b && ref_audio.empty()) {
+        std::fprintf(stderr,
+                     "tts: 1.5b model requires --ref-audio (raw 24 kHz mono "
+                     "WAV). Pre-baked --voice gguf files are realtime-0.5B "
+                     "only.\n");
+        return 1;
+    }
+    if (!is_15b && !ref_audio.empty()) {
+        std::fprintf(stderr,
+                     "tts: --ref-audio only applies to 1.5b models; this "
+                     "model is variant=%s. Use --voice with a voice gguf "
+                     "instead.\n", model.variant.c_str());
+        return 1;
+    }
+
     vv::VibeVoiceVoice voice;
     bool have_voice = false;
-    if (!voice_path.empty()) {
-        if (!vv::vibevoice_voice_load(voice_path, model, &voice)) {
-            std::fprintf(stderr, "tts: failed to load voice %s\n", voice_path.c_str());
-            return 6;
+    if (!is_15b) {
+        if (!voice_path.empty()) {
+            if (!vv::vibevoice_voice_load(voice_path, model, &voice)) {
+                std::fprintf(stderr, "tts: failed to load voice %s\n", voice_path.c_str());
+                return 6;
+            }
+            have_voice = true;
+        } else {
+            std::fprintf(stderr,
+                         "tts: WARNING — no --voice specified; output will be "
+                         "low-amplitude / incoherent. Convert one with "
+                         "scripts/convert_voice_to_gguf.py.\n");
         }
-        have_voice = true;
-    } else {
-        std::fprintf(stderr,
-                     "tts: WARNING — no --voice specified; output will be "
-                     "low-amplitude / incoherent. Convert one with "
-                     "scripts/convert_voice_to_gguf.py.\n");
     }
 
     vv::VibeVoiceTTSParams p;
     p.voice             = have_voice ? &voice : nullptr;
+    p.ref_audio_path    = ref_audio;
     p.max_speech_frames = max_frames;
     p.n_diffusion_steps = steps;
     p.cfg_scale         = cfg_scale;
