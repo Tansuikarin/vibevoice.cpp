@@ -101,6 +101,70 @@ python scripts/convert_voice_to_gguf.py --src /tmp/voice.pt --out models/voice.g
 This is the same roundtrip codified as `tests/test_closed_loop.cpp` - see
 [`docs/conversion.md`](docs/conversion.md) for how to wire it into ctest.
 
+## Quickstart - voice cloning (1.5B)
+
+The `microsoft/VibeVoice-1.5B` model conditions on a raw reference WAV
+at synthesis time — no separate voice gguf needed. Hand it ~5 s of any
+speaker and it'll synthesize new text in that voice.
+
+```bash
+hf download microsoft/VibeVoice-1.5B --local-dir models/vibevoice-1.5B
+python scripts/convert_vibevoice_to_gguf.py \
+  --src models/vibevoice-1.5B \
+  --out models/vibevoice-1.5B.gguf
+# shrink the gguf. Two recommended profiles for the 1.5B path:
+#
+#   1) Q8_0 across the board: 11 GB -> 6.8 GB, no measurable recall
+#      hit on the closed-loop benchmark.
+./build/bin/vibevoice-quantize \
+  --src  models/vibevoice-1.5B.gguf \
+  --out  models/vibevoice-1.5B-q8_0.gguf \
+  --type q8_0
+#
+#   2) Mixed: 11 GB -> 6.5 GB, same recall as fp32. FFN at Q6_K, attn
+#      at Q5_K, lm_head at Q8_0. Plain Q5_K across the board collapses
+#      this model (recall drops to 22%) — FFN weights are the most
+#      quant-sensitive piece, attention tolerates Q5_K well.
+./build/bin/vibevoice-quantize \
+  --src           models/vibevoice-1.5B.gguf \
+  --out           models/vibevoice-1.5B-mixed.gguf \
+  --type          q6_k    \
+  --attn-type     q5_k    \
+  --lm-head-type  q8_0
+
+./build/bin/vibevoice-cli tts \
+  --model     models/vibevoice-1.5B-q8_0.gguf \
+  --tokenizer models/tokenizer.gguf \
+  --ref-audio reference-voice.wav \
+  --text      "Hello world, this is a test of voice cloning." \
+  --out       cloned.wav
+```
+
+The same `tts` subcommand handles both model families: pass `--voice
+<voice.gguf>` for the realtime-0.5B path, or `--ref-audio <wav>` for
+runtime voice cloning on the 1.5B path. The CLI dispatches based on
+the loaded gguf's variant metadata; the two flags are mutually
+exclusive.
+
+**Multi-speaker dialog** (1.5B only): repeat `--ref-audio` per speaker
+and tag the lines with `Speaker N:` markers. The model uses each
+WAV's encoded features as the voice for the corresponding speaker.
+
+```bash
+./build/bin/vibevoice-cli tts \
+  --model     models/vibevoice-1.5B-q8_0.gguf \
+  --tokenizer models/tokenizer.gguf \
+  --ref-audio voice-carter.wav \
+  --ref-audio voice-emma.wav \
+  --text "$(printf ' Speaker 0: Hello, I am Carter.\n Speaker 1: And I am Emma.\n Speaker 0: Nice to meet you.')" \
+  --out dialog.wav
+```
+
+Note: voice cloning **only** works with the 1.5B variant. The
+realtime-0.5B weights ship without encoders, so they can't process a
+reference WAV at runtime — they only consume pre-baked voice gguf
+files (see `scripts/convert_voice_to_gguf.py`).
+
 ## Quickstart - ASR
 
 ```bash
@@ -145,7 +209,7 @@ VIBEVOICE_BACKEND=cuda ./build/bin/vibevoice-cli asr \
 ## Tests
 
 ```bash
-ctest --test-dir build --output-on-failure   # 12 ctest targets
+ctest --test-dir build --output-on-failure   # 21 ctest targets
 ```
 
 For the real-weight tests:
@@ -165,8 +229,12 @@ the layout LocalAI's `qwen3-tts-cpp` Go backend uses:
 ```c
 int  vv_capi_load(const char* tts_model, const char* asr_model,
                   const char* tokenizer, const char* voice, int n_threads);
-int  vv_capi_tts(const char* text, const char* voice_path, const char* dst_wav,
-                 int steps, float cfg, int max_speech_frames, uint32_t seed);
+// `voice_path` is for realtime-0.5B, `ref_audio_path` is for 1.5B
+// (runtime voice cloning); pass NULL for whichever the loaded model
+// doesn't need.
+int  vv_capi_tts(const char* text, const char* voice_path, const char* ref_audio_path,
+                 const char* dst_wav, int steps, float cfg, int max_speech_frames,
+                 uint32_t seed);
 int  vv_capi_asr(const char* src_wav, char* out_json, size_t out_capacity,
                  int max_new_tokens);
 void vv_capi_unload(void);
@@ -179,7 +247,7 @@ import "github.com/ebitengine/purego"
 
 var (
     Load     func(tts, asr, tok, voice string, threads int) int
-    TTS      func(text, voice, dst string, steps int, cfg float32, maxFrames int, seed uint32) int
+    TTS      func(text, voice, refAudio, dst string, steps int, cfg float32, maxFrames int, seed uint32) int
     ASR      func(src string, out []byte, outCap uint64, maxTok int) int
     Unload   func()
 )
