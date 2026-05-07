@@ -1,9 +1,7 @@
-name: Build Windows CUDA (Jimver)
+name: Build Windows CUDA (Manual)
 
 on:
-  workflow_dispatch: # 支持手动触发
-  push:
-    branches: [ master ] # 每次推送到 master 分支时自动编译
+  workflow_dispatch: # 仅手动触发
 
 jobs:
   build:
@@ -16,41 +14,44 @@ jobs:
           submodules: recursive
 
       - name: Install CUDA Toolkit
-        # 使用 Jimver 的 Action 安装 CUDA
         uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '13.2.0' # 建议使用 12.2 或 12.4，稳定性较好
-          method: 'network' # 网络安装，也可以选 'local'
+          cuda: '13.2.0' 
+          method: 'network'
 
       - name: Configure CMake
-        # Windows PowerShell 环境下使用 ` 作为换行符
-        # -DGGML_CUDA=ON 激活 GPU 支持
+        # VIBEVOICE_SHARED=OFF 解决 LNK2019 链接错误
         run: |
           cmake -B build `
             -DGGML_CUDA=ON `
             -DVIBEVOICE_BUILD_TESTS=OFF `
             -DCMAKE_BUILD_TYPE=Release `
-            -DVIBEVOICE_SHARED=ON
+            -DVIBEVOICE_SHARED=OFF
 
       - name: Build
         run: |
           cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
 
       - name: Verify Build
+        shell: pwsh
         run: |
-          if (Test-Path "build/bin/Release/vibevoice-cli.exe") {
-            echo "Build successful!"
+          Write-Host "Checking build output directory..."
+          if (Test-Path "build/bin/Release") {
             ls build/bin/Release/
           } else {
-            echo "Build failed: vibevoice-cli.exe not found"
+            Write-Error "Directory build/bin/Release not found!"
             exit 1
           }
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vibevoice-windows-cuda-v12.2
+          name: vibevoice-windows-full-binaries
+          # 收集所有相关的二进制文件
           path: |
             build/bin/Release/*.exe
             build/bin/Release/*.dll
+            build/bin/Release/*.lib
+            build/bin/Release/*.pdb
+          if-no-files-found: warn
