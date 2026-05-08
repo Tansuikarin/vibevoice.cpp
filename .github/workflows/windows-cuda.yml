@@ -18,7 +18,7 @@ jobs:
         id: cuda-toolkit
         with:
           cuda: '13.1.0' 
-          method: 'network'
+          method: 'local'
 
       - name: Configure CMake
         # VIBEVOICE_SHARED=OFF 解决 LNK2019 链接错误
